@@ -491,7 +491,10 @@ def aggregate_university_base(df: pd.DataFrame) -> pd.DataFrame:
         work["시도"] = work["지역별"]
     if "KEDI 학교코드" in work.columns and "학교코드" not in work.columns:
         work["학교코드"] = work["KEDI 학교코드"]
-        exclude = {"학교명", "학제", "대학원구분", "학교상태", "본분교", "시도", "시군구", "설립", "주소", "홈페이지", "학위과정", "대계열", "중계열", "소계열", "학과명"}
+    exclude = {
+        "학교명", "학제", "대학원구분", "학교상태", "본분교", "시도", "시군구", "설립",
+        "주소", "홈페이지", "학위과정", "대계열", "중계열", "소계열", "학과명",
+    }
     work = _coerce_numeric_columns(work, exclude)
 
     group_cols = [c for c in ["학교명", "학교코드", "시도", "설립", "학제"] if c in work.columns]
@@ -507,13 +510,14 @@ def aggregate_university_base(df: pd.DataFrame) -> pd.DataFrame:
     base = work.groupby(group_cols, dropna=False)[agg_sum_cols].sum(min_count=1).reset_index()
     base["학교명_key"] = normalize_school_name(base["학교명"])
 
-    # Derived metrics
-    base["지원경쟁률"] = base.get("지원자_전체_계", np.nan) / base.get("모집인원_학부_계", np.nan).replace(0, np.nan)
-    base["충원율"] = base.get("입학자_전체_계", np.nan) / base.get("모집인원_학부_계", np.nan).replace(0, np.nan)
-    base["재학생비율"] = base.get("재학생_전체_계", np.nan) / base.get("재적생_전체_계", np.nan).replace(0, np.nan)
-    base["휴학생비율"] = base.get("휴학생_전체_계", np.nan) / base.get("재적생_전체_계", np.nan).replace(0, np.nan)
-    base["외국인학생비율"] = base.get("외국 학생_총계_계", np.nan) / base.get("재적생_전체_계", np.nan).replace(0, np.nan)
-    base["전임교원1인당재학생"] = base.get("재학생_전체_계", np.nan) / base.get("전임교원_계", np.nan).replace(0, np.nan)
+    recruit = _col_series(base, "모집인원_학부_계").replace(0, np.nan)
+    enrolled_total = _col_series(base, "재적생_전체_계").replace(0, np.nan)
+    base["지원경쟁률"] = _col_series(base, "지원자_전체_계") / recruit
+    base["충원율"] = _col_series(base, "입학자_전체_계") / recruit
+    base["재학생비율"] = _col_series(base, "재학생_전체_계") / enrolled_total
+    base["휴학생비율"] = _col_series(base, "휴학생_전체_계") / enrolled_total
+    base["외국인학생비율"] = _col_series(base, "외국 학생_총계_계") / enrolled_total
+    base["전임교원1인당재학생"] = _col_series(base, "재학생_전체_계") / _col_series(base, "전임교원_계").replace(0, np.nan)
     return base
 
 
@@ -870,24 +874,42 @@ integrated = pd.DataFrame()
 marts: Dict[str, pd.DataFrame] = {}
 data_load_error: str | None = None
 data_load_error_kind: str | None = None
+data_load_traceback: str | None = None
+raw_data: Dict[str, pd.DataFrame] = {}
 
 try:
     if mode == "기본 경로 사용":
         raw_data = load_all_from_paths(DEFAULT_FILES)
     else:
         raw_data = load_from_uploads(uploaded)
-
-    integrated, marts = build_integrated(raw_data)
-    integrated = _normalize_dimension_columns(integrated)
 except FileNotFoundError as e:
     data_load_error = str(e)
     data_load_error_kind = "missing"
+    data_load_traceback = traceback.format_exc()
 except Exception as e:
-    data_load_error = str(e)
-    data_load_error_kind = "other"
+    data_load_error = f"[CSV 로드 단계] {e}"
+    data_load_error_kind = "load"
+    data_load_traceback = traceback.format_exc()
+
+if not data_load_error:
+    try:
+        integrated, marts = build_integrated(raw_data)
+        integrated = _normalize_dimension_columns(integrated)
+    except Exception as e:
+        data_load_error = f"[데이터 통합 단계] {e}"
+        data_load_error_kind = "integrate"
+        data_load_traceback = traceback.format_exc()
 
 if data_load_error:
     st.error(f"데이터 로딩/통합 중 오류가 발생했습니다: {data_load_error}")
+    if data_load_traceback:
+        with st.expander("오류 상세 (traceback)"):
+            st.code(data_load_traceback)
+    if raw_data:
+        st.caption(
+            "CSV 로드 행 수: "
+            + ", ".join(f"{k}={len(v):,}" for k, v in raw_data.items())
+        )
     if mode == "기본 경로 사용":
         with st.expander("필요 파일 목록 / 경로 확인"):
             for key, rel in DEFAULT_FILES.items():
@@ -898,13 +920,13 @@ if data_load_error:
         if data_load_error_kind == "missing":
             st.info(
                 "로컬 PC에 파일이 있어도 **GitHub에 push되지 않으면** Streamlit Cloud에서는 "
-                "파일이 없습니다. `University_IR/output/` CSV를 `git add` · `git push` 하거나, "
+                "파일이 없습니다. `output/` CSV를 `git add` · `git push` 하거나, "
                 "사이드바 **「CSV 직접 업로드」** 를 사용하세요."
             )
-        else:
+        elif data_load_error_kind in ("load", "integrate"):
             st.info(
-                "CSV 경로는 정상일 수 있습니다. 위 **오류 메시지 본문**을 확인하세요. "
-                "(파일 읽기·통합 단계 오류일 수 있습니다.)"
+                "CSV 경로는 정상입니다(✅). **오류 상세(traceback)** 과 위 빨간색 메시지를 "
+                "확인해 주세요. 수정된 코드 push 후 **Reboot app** · **Clear cache**를 실행하세요."
             )
     st.stop()
 
