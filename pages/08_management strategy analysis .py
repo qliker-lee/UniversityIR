@@ -822,18 +822,17 @@ def run_clustering(df: pd.DataFrame, features: list[str], k: int):
         st.warning("scikit-learn이 설치되어 있지 않아 군집 분석을 건너뜁니다. `pip install scikit-learn` 후 사용하세요.")
         return df
     cdf = df.copy()
+    cdf["Cluster"] = pd.Series(pd.NA, index=cdf.index, dtype="string")
     model_df = cdf[features].apply(pd.to_numeric, errors="coerce")
     valid = model_df.dropna()
     if len(valid) < k:
         st.info("군집 분석에 충분한 데이터가 없습니다.")
-        cdf["Cluster"] = np.nan
         return cdf
     scaler = StandardScaler()
     X = scaler.fit_transform(valid)
     km = KMeans(n_clusters=k, random_state=42, n_init=10)
     labels = km.fit_predict(X)
-    cdf["Cluster"] = np.nan
-    cdf.loc[valid.index, "Cluster"] = labels.astype(str)
+    cdf.loc[valid.index, "Cluster"] = pd.array(labels.astype(str), dtype="string")
     return cdf
 
 
