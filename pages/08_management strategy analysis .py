@@ -1210,10 +1210,26 @@ with tab5:
     )
     k = st.slider("군집 수 K", 2, 8, 4)
     clustered = run_clustering(filtered, cluster_features, k)
-    if "Cluster" in clustered.columns and clustered["Cluster"].notna().any():
-        fig = px.scatter(clustered, x=cluster_features[0], y=cluster_features[1], color="Cluster", size="재학생_전체_계", hover_name="학교명", title="K-Means 군집 분석 결과")
-        show_plot(fig, clustered, selected_school, x=cluster_features[0], y=cluster_features[1])
-        st.dataframe(clustered[["학교명", "시도", "설립", "Cluster"] + cluster_features].sort_values("Cluster"), use_container_width=True, hide_index=True)
+    cluster_plot = clustered[clustered["Cluster"].notna()].copy()
+    if len(cluster_features) >= 2 and not cluster_plot.empty:
+        cluster_plot["Cluster"] = cluster_plot["Cluster"].astype(str)
+        fig = px.scatter(
+            cluster_plot,
+            x=cluster_features[0],
+            y=cluster_features[1],
+            color="Cluster",
+            size="재학생_전체_계",
+            hover_name="학교명",
+            title="K-Means 군집 분석 결과",
+        )
+        show_plot(fig, cluster_plot, selected_school, x=cluster_features[0], y=cluster_features[1])
+        st.dataframe(
+            cluster_plot[["학교명", "시도", "설립", "Cluster"] + cluster_features].sort_values("Cluster"),
+            use_container_width=True,
+            hide_index=True,
+        )
+    elif len(cluster_features) < 2:
+        st.info("군집 산점도를 그리려면 군집 변수를 2개 이상 선택하세요.")
 
 with tab6:
     st.subheader("7. 데이터 품질/원천 확인")
