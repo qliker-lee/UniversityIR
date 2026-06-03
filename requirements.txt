@@ -1,0 +1,17 @@
+# University IR (Streamlit Cloud) — pages + university_ir.py
+# 설치: pip install -r requirements.txt
+# 배포: 저장소 루트(universityir)에 이 파일을 두고 Reboot app
+
+# --- 앱 프레임워크 ---
+streamlit>=1.38.0
+
+# --- 데이터 ---
+pandas>=2.2.0
+numpy>=1.26.0
+
+# --- 시각화 (pages 03~10, 08, 09, university_ir.py) ---
+plotly>=5.24.0
+altair>=5.0.0
+
+# --- 통계·분석 (08_management strategy analysis — KMeans/회귀) ---
+scikit-learn>=1.4.0
