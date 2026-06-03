@@ -184,6 +184,38 @@ def normalize_branch(value: object) -> str:
     return BRANCH_ALIASES.get(s, s)
 
 
+def _coerce_label(value: object) -> str:
+    """계열·학과 등 라벨 컬럼 값을 정렬·집합 가능한 문자열로 변환."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (list, dict, tuple, set)):
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("nan", "none", "<na>", "nat"):
+        return ""
+    return s
+
+
+def _unique_non_empty_labels(column_data: pd.Series | pd.DataFrame) -> list[str]:
+    """Series(또는 동명 컬럼 DataFrame)에서 비어 있지 않은 고유 라벨 목록."""
+    if isinstance(column_data, pd.DataFrame):
+        column_data = column_data.iloc[:, 0] if column_data.shape[1] else pd.Series(dtype=object)
+    seen: set[str] = set()
+    labels: list[str] = []
+    for raw in column_data.tolist():
+        label = _coerce_label(raw)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return sorted(labels)
+
+
 def list_year_data_paths() -> list[Path]:
     paths: list[Path] = []
     for year in range(YEAR_START, LATEST_YEAR + 1):
@@ -645,13 +677,7 @@ def list_drill_options(
     if column not in df.columns:
         return []
     sub = apply_hierarchy_filters(df, filters)
-    vals = (
-        sub[column]
-        .astype(str)
-        .str.strip()
-        .replace({"nan": "", "None": ""})
-    )
-    return sorted({v for v in vals if v})
+    return _unique_non_empty_labels(sub[column])
 
 
 def get_school_department_frame(
@@ -768,14 +794,7 @@ def list_major_categories(
     subset = filter_school(df, school_code, branch, school_name)
     if MAJOR_COLUMN not in subset.columns:
         return []
-    majors = (
-        subset[MAJOR_COLUMN]
-        .astype(str)
-        .str.strip()
-        .replace({"nan": "", "None": ""})
-    )
-    uniq = sorted({m for m in majors if m})
-    return uniq
+    return _unique_non_empty_labels(subset[MAJOR_COLUMN])
 
 
 def filter_school(
