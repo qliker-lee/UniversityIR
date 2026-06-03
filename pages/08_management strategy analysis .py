@@ -95,7 +95,7 @@ def read_csv_safely(file_or_path) -> pd.DataFrame:
         raw = file_or_path.getvalue()
         for enc in encodings:
             try:
-                return pd.read_csv(io.BytesIO(raw), encoding=enc)
+                return pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False)
             except Exception as e:
                 last_err = e
         raise last_err
@@ -103,10 +103,19 @@ def read_csv_safely(file_or_path) -> pd.DataFrame:
     path = Path(file_or_path)
     for enc in encodings:
         try:
-            return pd.read_csv(path, encoding=enc)
+            return pd.read_csv(path, encoding=enc, low_memory=False)
         except Exception as e:
             last_err = e
     raise last_err
+
+
+def _col_series(df: pd.DataFrame, col: str, default: float = np.nan) -> pd.Series:
+    """DataFrame에서 컬럼 Series 반환. 없으면 행 수에 맞는 NaN Series."""
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce")
+    if df.empty:
+        return pd.Series(dtype=float)
+    return pd.Series(default, index=df.index, dtype=float)
 
 
 def find_existing_default(filename: str) -> Optional[Path]:
@@ -123,7 +132,44 @@ def find_existing_default(filename: str) -> Optional[Path]:
     for p in candidates:
         if p.exists():
             return p
+
+    # Cloud/Linux 등에서 한글 파일명·경로 차이 대비: output 폴더 패턴 검색
+    if OUTPUT_DIR.is_dir():
+        glob_map = {
+            "장학금": "*장학금*.csv",
+            "등록금": "*등록금*.csv",
+            "학비감면": "*학비감면*.csv",
+        }
+        for token, pattern in glob_map.items():
+            if token in basename:
+                hits = sorted(OUTPUT_DIR.glob(pattern))
+                if hits:
+                    return hits[-1]
+        if basename.endswith("_data.csv"):
+            year_match = re.search(r"(20\d{2})_data\.csv$", basename)
+            if year_match:
+                hits = sorted(OUTPUT_DIR.glob(f"{year_match.group(1)}_data.csv"))
+                if hits:
+                    return hits[0]
+        if basename.endswith("_job.csv"):
+            year_match = re.search(r"(20\d{2})_job\.csv$", basename)
+            if year_match:
+                hits = sorted(OUTPUT_DIR.glob(f"{year_match.group(1)}_job.csv"))
+                if hits:
+                    return hits[0]
     return None
+
+
+def resolve_default_data_paths(paths: Dict[str, str]) -> tuple[Dict[str, Optional[Path]], list[str]]:
+    """기본 CSV 경로 해석. 누락 파일 목록을 함께 반환."""
+    resolved: Dict[str, Optional[Path]] = {}
+    missing: list[str] = []
+    for key, filename in paths.items():
+        p = find_existing_default(filename)
+        resolved[key] = p
+        if p is None:
+            missing.append(filename)
+    return resolved, missing
 
 
 def to_num(series: pd.Series) -> pd.Series:
@@ -342,10 +388,16 @@ def _load_pages_markdown(md_path: str) -> str:
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_all_from_paths(paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-    data = {}
-    for key, filename in paths.items():
-        p = find_existing_default(filename)
-        data[key] = read_csv_safely(p) if p else pd.DataFrame()
+    resolved, missing = resolve_default_data_paths(paths)
+    if missing:
+        raise FileNotFoundError(
+            "필수 CSV 파일을 찾을 수 없습니다. "
+            f"output/ 폴더 또는 Git 저장소에 포함했는지 확인하세요.\n"
+            + "\n".join(f"  - {name}" for name in missing)
+        )
+    data: Dict[str, pd.DataFrame] = {}
+    for key, path in resolved.items():
+        data[key] = read_csv_safely(path) if path else pd.DataFrame()
     return data
 
 
@@ -414,7 +466,16 @@ def aggregate_job(df: pd.DataFrame) -> pd.DataFrame:
     # Weighted employment rates by graduates.
     rate_cols = [c for c in ["취업률_계", "진학률_계", "1차 유지취업률_계", "2차 유지취업률_계", "3차 유지취업률_계", "4차 유지취업률_계"] if c in work.columns]
     for rc in rate_cols:
-        wm = work.groupby(group_cols).apply(lambda x, r=rc: weighted_mean(x, r, "졸업자_계")).rename(rc)
+        grouped = work.groupby(group_cols, dropna=False)
+        try:
+            wm = grouped.apply(
+                lambda x, r=rc: weighted_mean(x, r, "졸업자_계"),
+                include_groups=False,
+            ).rename(rc)
+        except TypeError:
+            wm = grouped.apply(
+                lambda x, r=rc: weighted_mean(x, r, "졸업자_계"),
+            ).rename(rc)
         job = job.merge(wm.reset_index(), on=group_cols, how="left")
 
     job["학교명_key"] = normalize_school_name(job["학교명"])
@@ -487,6 +548,15 @@ def build_integrated(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[
     tuition = aggregate_tuition(data.get("tuition", pd.DataFrame()))
     red = aggregate_reduction(data.get("reduction", pd.DataFrame()))
 
+    if base.empty:
+        return pd.DataFrame(), {
+            "base": base,
+            "job": job,
+            "scholarship": sch,
+            "tuition": tuition,
+            "reduction": red,
+        }
+
     merged = base.copy()
     if not job.empty:
         job_cols = ["학교명_key"] + [c for c in job.columns if c not in ["학교명", "시도", "설립", "학제", "학교명_key"]]
@@ -502,9 +572,10 @@ def build_integrated(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[
         merged = merged.merge(red[red_cols], on="학교명_key", how="left")
 
     # Financial/student derived metrics
-    merged["학생1인당장학금"] = merged.get("장학금총액", np.nan) / merged.get("재적생_전체_계", np.nan).replace(0, np.nan)
-    merged["장학금_등록금대비"] = merged.get("장학금총액", np.nan) / merged.get("등록금수입", np.nan).replace(0, np.nan)
-    merged["등록금_재학생가중부담"] = merged.get("평균등록금", np.nan) * merged.get("재학생_전체_계", np.nan)
+    enrolled = _col_series(merged, "재적생_전체_계").replace(0, np.nan)
+    merged["학생1인당장학금"] = _col_series(merged, "장학금총액") / enrolled
+    merged["장학금_등록금대비"] = _col_series(merged, "장학금총액") / _col_series(merged, "등록금수입").replace(0, np.nan)
+    merged["등록금_재학생가중부담"] = _col_series(merged, "평균등록금") * _col_series(merged, "재학생_전체_계")
 
     # Risk/opportunity scores
     merged["입학리스크"] = 1 - add_percentile(merged, "지원경쟁률", True) * 0.45 - add_percentile(merged, "충원율", True) * 0.35 - add_percentile(merged, "재학생비율", True) * 0.20
@@ -736,6 +807,16 @@ except Exception as e:
 
 if data_load_error:
     st.error(f"데이터 로딩/통합 중 오류가 발생했습니다: {data_load_error}")
+    if mode == "기본 경로 사용":
+        st.info(
+            "Streamlit Cloud 배포 시 **`University_IR/output/`** 폴더의 CSV 5개가 "
+            "저장소에 포함되어 있어야 합니다. "
+            "또는 사이드바에서 **「CSV 직접 업로드」** 를 선택해 파일을 올려 주세요."
+        )
+        with st.expander("필요 파일 목록"):
+            for key, rel in DEFAULT_FILES.items():
+                p = find_existing_default(rel)
+                st.write(f"- **{key}**: `{rel}` → {'✅ ' + str(p) if p else '❌ 없음'}")
     st.stop()
     raise SystemExit(1)
 
