@@ -78,6 +78,15 @@ DEFAULT_FILES = {
     "reduction": "output/한국장학재단_대학별 학비감면_20250831.csv",
 }
 
+# 키별 output 폴더 탐색 패턴 (한글 파일명·Cloud 경로 차이 대비)
+_DATA_FILE_GLOBS: Dict[str, tuple[str, ...]] = {
+    "university": ("2024_data.csv", "*2024*_data.csv", "*_data.csv"),
+    "job": ("2024_job.csv", "*2024*_job.csv", "*_job.csv"),
+    "scholarship": ("*장학금*.csv",),
+    "tuition": ("*등록금*.csv",),
+    "reduction": ("*학비감면*.csv",),
+}
+
 
 # -----------------------------------------------------------------------------
 # Utility
@@ -118,7 +127,47 @@ def _col_series(df: pd.DataFrame, col: str, default: float = np.nan) -> pd.Serie
     return pd.Series(default, index=df.index, dtype=float)
 
 
-def find_existing_default(filename: str) -> Optional[Path]:
+def _iter_output_dirs() -> list[Path]:
+    """Streamlit Cloud·로컬 등 다양한 배포 구조에서 output 폴더 후보 수집."""
+    page_dir = Path(__file__).resolve().parent
+    app_root = page_dir.parent
+    root_candidates = [
+        app_root,
+        Path.cwd(),
+        app_root.parent / "University_IR",
+        Path.cwd() / "University_IR",
+    ]
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for root in root_candidates:
+        try:
+            root = root.resolve()
+        except OSError:
+            continue
+        for folder in ("output", "Output", "OUTPUT"):
+            out = root / folder
+            key = str(out)
+            if key in seen or not out.is_dir():
+                continue
+            seen.add(key)
+            dirs.append(out)
+    return dirs
+
+
+def _pick_from_glob(directory: Path, key: str, patterns: tuple[str, ...]) -> Optional[Path]:
+    """디렉터리에서 키에 맞는 CSV 1개 선택."""
+    for pattern in patterns:
+        hits = sorted(directory.glob(pattern))
+        if not hits:
+            continue
+        if key in ("university", "job"):
+            preferred = [h for h in hits if h.name.startswith("2024")]
+            return preferred[0] if preferred else hits[-1]
+        return hits[-1]
+    return None
+
+
+def find_existing_default(filename: str, *, data_key: str | None = None) -> Optional[Path]:
     basename = Path(filename).name
     candidates = [
         Path(filename),
@@ -127,37 +176,39 @@ def find_existing_default(filename: str) -> Optional[Path]:
         BASE_PATH / filename,
         OUTPUT_DIR / basename,
         BASE_PATH / "output" / basename,
+        Path.cwd() / "University_IR" / "output" / basename,
         Path("/mnt/data") / basename,
     ]
     for p in candidates:
-        if p.exists():
-            return p
+        if p.is_file():
+            return p.resolve()
 
-    # Cloud/Linux 등에서 한글 파일명·경로 차이 대비: output 폴더 패턴 검색
-    if OUTPUT_DIR.is_dir():
-        glob_map = {
-            "장학금": "*장학금*.csv",
-            "등록금": "*등록금*.csv",
-            "학비감면": "*학비감면*.csv",
-        }
-        for token, pattern in glob_map.items():
-            if token in basename:
-                hits = sorted(OUTPUT_DIR.glob(pattern))
-                if hits:
-                    return hits[-1]
-        if basename.endswith("_data.csv"):
-            year_match = re.search(r"(20\d{2})_data\.csv$", basename)
-            if year_match:
-                hits = sorted(OUTPUT_DIR.glob(f"{year_match.group(1)}_data.csv"))
-                if hits:
-                    return hits[0]
-        if basename.endswith("_job.csv"):
-            year_match = re.search(r"(20\d{2})_job\.csv$", basename)
-            if year_match:
-                hits = sorted(OUTPUT_DIR.glob(f"{year_match.group(1)}_job.csv"))
-                if hits:
-                    return hits[0]
+    globs = _DATA_FILE_GLOBS.get(data_key or "", ())
+    for out_dir in _iter_output_dirs():
+        direct = out_dir / basename
+        if direct.is_file():
+            return direct.resolve()
+        if globs:
+            hit = _pick_from_glob(out_dir, data_key or "", globs)
+            if hit is not None:
+                return hit.resolve()
     return None
+
+
+def _output_dir_diagnostics() -> str:
+    """Cloud 디버깅용: 탐색한 output 경로 및 CSV 목록."""
+    lines = [
+        f"- `__file__` 기준 앱 루트: `{BASE_PATH}`",
+        f"- 기본 OUTPUT_DIR: `{OUTPUT_DIR}` (exists={OUTPUT_DIR.is_dir()})",
+        f"- 현재 작업 디렉터리: `{Path.cwd()}`",
+    ]
+    for out_dir in _iter_output_dirs():
+        csv_names = sorted(p.name for p in out_dir.glob("*.csv"))
+        preview = ", ".join(csv_names[:8])
+        if len(csv_names) > 8:
+            preview += f", … (+{len(csv_names) - 8}개)"
+        lines.append(f"- `{out_dir}` — CSV {len(csv_names)}개: {preview or '(없음)'}")
+    return "\n".join(lines)
 
 
 def resolve_default_data_paths(paths: Dict[str, str]) -> tuple[Dict[str, Optional[Path]], list[str]]:
@@ -165,7 +216,7 @@ def resolve_default_data_paths(paths: Dict[str, str]) -> tuple[Dict[str, Optiona
     resolved: Dict[str, Optional[Path]] = {}
     missing: list[str] = []
     for key, filename in paths.items():
-        p = find_existing_default(filename)
+        p = find_existing_default(filename, data_key=key)
         resolved[key] = p
         if p is None:
             missing.append(filename)
@@ -390,14 +441,23 @@ def _load_pages_markdown(md_path: str) -> str:
 def load_all_from_paths(paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
     resolved, missing = resolve_default_data_paths(paths)
     if missing:
+        diag = _output_dir_diagnostics()
         raise FileNotFoundError(
-            "필수 CSV 파일을 찾을 수 없습니다. "
-            f"output/ 폴더 또는 Git 저장소에 포함했는지 확인하세요.\n"
+            "필수 CSV 파일을 찾을 수 없습니다.\n"
             + "\n".join(f"  - {name}" for name in missing)
+            + "\n\n[경로 진단]\n"
+            + diag
+            + "\n\n로컬에만 있고 Git에 push되지 않은 경우 Cloud에서는 보이지 않습니다. "
+            "`git add University_IR/output/*.csv` 후 push 하세요."
         )
     data: Dict[str, pd.DataFrame] = {}
     for key, path in resolved.items():
-        data[key] = read_csv_safely(path) if path else pd.DataFrame()
+        if path is None:
+            continue
+        try:
+            data[key] = read_csv_safely(path)
+        except Exception as exc:
+            raise OSError(f"{key} 파일 읽기 실패: `{path}` — {exc}") from exc
     return data
 
 
@@ -793,6 +853,7 @@ with st.sidebar:
 integrated = pd.DataFrame()
 marts: Dict[str, pd.DataFrame] = {}
 data_load_error: str | None = None
+data_load_error_kind: str | None = None
 
 try:
     if mode == "기본 경로 사용":
@@ -802,23 +863,34 @@ try:
 
     integrated, marts = build_integrated(raw_data)
     integrated = _normalize_dimension_columns(integrated)
+except FileNotFoundError as e:
+    data_load_error = str(e)
+    data_load_error_kind = "missing"
 except Exception as e:
     data_load_error = str(e)
+    data_load_error_kind = "other"
 
 if data_load_error:
     st.error(f"데이터 로딩/통합 중 오류가 발생했습니다: {data_load_error}")
     if mode == "기본 경로 사용":
-        st.info(
-            "Streamlit Cloud 배포 시 **`University_IR/output/`** 폴더의 CSV 5개가 "
-            "저장소에 포함되어 있어야 합니다. "
-            "또는 사이드바에서 **「CSV 직접 업로드」** 를 선택해 파일을 올려 주세요."
-        )
-        with st.expander("필요 파일 목록"):
+        with st.expander("필요 파일 목록 / 경로 확인"):
             for key, rel in DEFAULT_FILES.items():
-                p = find_existing_default(rel)
+                p = find_existing_default(rel, data_key=key)
                 st.write(f"- **{key}**: `{rel}` → {'✅ ' + str(p) if p else '❌ 없음'}")
+            st.markdown("**output 폴더 진단**")
+            st.code(_output_dir_diagnostics())
+        if data_load_error_kind == "missing":
+            st.info(
+                "로컬 PC에 파일이 있어도 **GitHub에 push되지 않으면** Streamlit Cloud에서는 "
+                "파일이 없습니다. `University_IR/output/` CSV를 `git add` · `git push` 하거나, "
+                "사이드바 **「CSV 직접 업로드」** 를 사용하세요."
+            )
+        else:
+            st.info(
+                "CSV 경로는 정상일 수 있습니다. 위 **오류 메시지 본문**을 확인하세요. "
+                "(파일 읽기·통합 단계 오류일 수 있습니다.)"
+            )
     st.stop()
-    raise SystemExit(1)
 
 if integrated.empty or "학교명" not in integrated.columns:
     st.warning("분석 가능한 대학 기본 데이터가 없습니다. CSV 파일 위치 또는 업로드 상태를 확인하세요.")
