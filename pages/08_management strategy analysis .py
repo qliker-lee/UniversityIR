@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import re
+import traceback
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -221,6 +222,16 @@ def resolve_default_data_paths(paths: Dict[str, str]) -> tuple[Dict[str, Optiona
         if p is None:
             missing.append(filename)
     return resolved, missing
+
+
+def _coerce_numeric_columns(df: pd.DataFrame, exclude: set[str]) -> pd.DataFrame:
+    """문자열 컬럼을 제외하고 숫자형으로 변환 (pandas 3.x errors='ignore' 제거 대응)."""
+    out = df.copy()
+    for col in out.columns:
+        if col in exclude:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
 
 
 def to_num(series: pd.Series) -> pd.Series:
@@ -480,9 +491,8 @@ def aggregate_university_base(df: pd.DataFrame) -> pd.DataFrame:
         work["시도"] = work["지역별"]
     if "KEDI 학교코드" in work.columns and "학교코드" not in work.columns:
         work["학교코드"] = work["KEDI 학교코드"]
-    for c in work.columns:
-        if c not in ["학교명", "학제", "대학원구분", "학교상태", "본분교", "시도", "시군구", "설립", "주소", "홈페이지", "학위과정", "대계열", "중계열", "소계열", "학과명"]:
-            work[c] = pd.to_numeric(work[c], errors="ignore")
+        exclude = {"학교명", "학제", "대학원구분", "학교상태", "본분교", "시도", "시군구", "설립", "주소", "홈페이지", "학위과정", "대계열", "중계열", "소계열", "학과명"}
+    work = _coerce_numeric_columns(work, exclude)
 
     group_cols = [c for c in ["학교명", "학교코드", "시도", "설립", "학제"] if c in work.columns]
     if "학교명" not in group_cols:
@@ -511,9 +521,11 @@ def aggregate_job(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
     work = df.copy()
-    for c in work.columns:
-        if c not in ["학교명", "학제", "학교상태", "본분교", "시도", "설립", "과정구분", "대계열", "중계열", "소계열", "학과명", "학위구분", "조사기준일"]:
-            work[c] = pd.to_numeric(work[c], errors="ignore")
+    text_cols = {
+        "학교명", "학제", "학교상태", "본분교", "시도", "설립", "과정구분",
+        "대계열", "중계열", "소계열", "학과명", "학위구분", "조사기준일",
+    }
+    work = _coerce_numeric_columns(work, text_cols)
 
     group_cols = ["학교명", "시도", "설립", "학제"]
     sum_cols = [
@@ -560,16 +572,20 @@ def aggregate_scholarship(df: pd.DataFrame) -> pd.DataFrame:
 def aggregate_tuition(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
+    required = ["대학명", "학제별", "설립별", "지역별", "평균등록금(원)"]
+    if any(col not in df.columns for col in required):
+        return pd.DataFrame()
     work = df.copy()
     for c in ["입학정원", "평균입학금", "평균등록금(원)"]:
-        if c in work:
+        if c in work.columns:
             work[c] = to_num(work[c])
     group_cols = ["대학명", "학제별", "설립별", "지역별"]
-    tuition = work.groupby(group_cols, dropna=False).agg(
-        입학정원=("입학정원", "sum"),
-        평균입학금=("평균입학금", "mean"),
-        평균등록금=("평균등록금(원)", "mean"),
-    ).reset_index()
+    agg_spec: dict[str, tuple[str, str]] = {"평균등록금": ("평균등록금(원)", "mean")}
+    if "입학정원" in work.columns:
+        agg_spec["입학정원"] = ("입학정원", "sum")
+    if "평균입학금" in work.columns:
+        agg_spec["평균입학금"] = ("평균입학금", "mean")
+    tuition = work.groupby(group_cols, dropna=False).agg(**agg_spec).reset_index()
     tuition["학교명_key"] = normalize_school_name(tuition["대학명"])
     return tuition
 
@@ -654,7 +670,7 @@ def build_integrated(data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, Dict[
         add_percentile(merged, "장학금_등록금대비", True) * 0.15
     )
     merged["전략분류"] = pd.cut(
-        merged["성과지수"],
+        pd.to_numeric(merged["성과지수"], errors="coerce"),
         bins=[-0.01, 0.35, 0.60, 1.01],
         labels=["구조개선 필요", "선택적 투자", "성장/확산"],
     )
