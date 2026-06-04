@@ -1,0 +1,2397 @@
+제시해주신 "입학수요위험도"는 학령인구 감소 직격탄을 맞고 있는 현재의 대학 IR(기관연구) 및 기획처에서 가장 핵심적으로 관리해야 하는 정량적 위기 지표입니다.
+
+정의해주신 4대 인자(지역 학령인구 감소, 대학 자체 경쟁력, 지역 내 경쟁 강도, 대학 규모 의존성)와 세부 필요 데이터(출생아, 고교 졸업자, 순이동 등)를 유기적으로 결합하여, 위험도를 점수화(0~100점)하고 이를 시각화하는 Python Streamlit 시각화 프로그램 아키텍처와 코드를 작성해 드립니다.
+
+1. 입학수요위험도 데이터 모델링 구조 (IR 설계 안)
+시스템의 정합성을 위해 입력 데이터를 다음과 같이 4대 지표로 표준화하여 연산합니다.
+
+지역 학령인구 감소 지표 (Demographic Weight): 출생아 수 변동률 + 고교 졸업자 수 추세 + 청년 유출률 반영
+
+대학 자체 경쟁력 지표 (Institutional Power): 최근 신입생 충원율 및 전년도 정시/수시 입시 경쟁률 역산
+
+지역 내 경쟁 강도 지표 (Regional Rivalry): 해당 권역 내 타 대학 수 및 정원 총합 대비 고교 졸업자 수 비율
+
+대학 규모 의존성 지표 (Scale Dependency): 대학 전체 재정 중 '등록금 수입 비중' 및 '전체 편제 정원 규모' (정원이 클수록 미충원 시 재정 타격이 기하급수적으로 증가)
+
+2. Streamlit 입학수요위험도 시각화 프로그램 코드
+이 코드는 가상의 공시 지표 데이터를 토대로 위험도 포트폴리오 매트릭스와 지역별 위험도 랭킹을 한눈에 보여주는 대시보드입니다.
+
+
+Gemini와의 대화
+위 파일을 이용하여 DataSense 소개자료를 15페이지로 작성해주세요. 제안서 제출용입니다.
+
+Generating slides ...
+DataSense Solution Proposal
+5월 26일 오후 1:32
+
+DataSense 소개 및 제안서 슬라이드 제작이 완료되었습니다! 전문 컨설팅 스타일의 레이아웃과 데이터 시각화를 통해 솔루션의 핵심 가치를 효과적으로 전달할 수 있도록 구성하였습니다. 추가 수정이나 보완이 필요하시면 언제든 말씀해 주세요.
+
+위 프로그램에서 더 다양한 분석하는 기능을 추가하고 싶습니다. 그리고 다양한 그래프로 추가하고자 합니다. 도와주세요
+
+기존의 대학 IR 대시보드 기능을 확장하여, 데이터 간의 상관관계(Scatter), 분포(Histogram), 그룹별 편차(Box plot) 등 전문적인 IR(Institutional Research) 분석 기능을 추가해 드리겠습니다.
+
+주요 추가 기능
+파생 지표 확장: 입학률(정원 대비 입학자), 실질 부담 등록금(등록금 - 인당 장학금) 추가
+
+상관관계 분석: 등록금과 장학금 간의 관계 시각화
+
+분포 분석: 주요 지표의 대학별 분포 확인
+
+그룹별 편차 분석: 지역/설립별 지표의 변동성(Box plot) 확인
+
+전체 코드를 업데이트하였습니다.
+
+Python
+import altair as alt
+import pandas as pd
+import streamlit as st
+from pathlib import Path
+
+st.set_page_config(page_title="University IR Intelligence Pro", layout="wide")
+
+BASE_PATH = Path(__file__).resolve().parent.parent
+BILLION_WON = 1_000_000_000
+
+# 컬럼 정의 확장
+COUNT_COLS = ("학과수", "입학정원", "입학자_학부")
+AMOUNT_COLS = ("평균등록금(원)", "교외장학금", "교내장학금", "장학금_총계")
+# 신규 지표 추가: 입학률, 실질부담금
+DERIVED_METRIC_COLS = ("인당장학금", "입학률", "실질부담금") 
+FILTER_COLS = ("학교명", "학제별", "설립별", "지역별")
+QUOTA_BIN_COL = "입학정원_구간"
+QUOTA_BIN_COUNT = 10
+
+METRIC_CHART_LABELS = {
+    "학과수": "학과수",
+    "입학정원": "입학정원",
+    "입학자_학부": "입학자(학부)",
+    "평균등록금(원)": "평균등록금(원)",
+    "교외장학금": "교외장학금",
+    "교내장학금": "교내장학금",
+    "장학금_총계": "장학금 총계",
+    "인당장학금": "인당장학금(원)",
+    "입학률": "입학률(%)",
+    "실질부담금": "실질부담금(등록금-장학금)",
+}
+MAX_SCHOOLS_ON_CHART = 50
+
+# --- 데이터 처리 함수 (기존 유지 및 보강) ---
+def _read_csv(path: Path) -> pd.DataFrame:
+    for enc in ("utf-8-sig", "utf-8", "cp949"):
+        try: return pd.read_csv(path, encoding=enc, low_memory=False)
+        except: continue
+    return pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+
+def _clean_to_numeric(series: pd.Series) -> pd.Series:
+    cleaned = series.astype(str).str.replace(r"[^0-9.-]", "", regex=True)
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0)
+
+def fix_count_columns(df: pd.DataFrame, columns: tuple[str, ...]) -> pd.DataFrame:
+    for col in columns:
+        if col in df.columns:
+            df[col] = _clean_to_numeric(df[col]).astype("int64")
+    return df
+
+# --- [신규] 다양한 시각화 함수 추가 ---
+
+def _plot_correlation_scatter(df: pd.DataFrame, x_col: str, y_col: str):
+    """두 지표 간의 상관관계 산점도"""
+    chart = alt.Chart(df).mark_circle(size=60).encode(
+        x=alt.X(f"{x_col}:Q", title=METRIC_CHART_LABELS.get(x_col, x_col)),
+        y=alt.Y(f"{y_col}:Q", title=METRIC_CHART_LABELS.get(y_col, y_col)),
+        color='설립별:N',
+        shape='학제별:N',
+        tooltip=['학교명', x_col, y_col, '지역별']
+    ).properties(height=450, title=f"{METRIC_CHART_LABELS.get(x_col)} vs {METRIC_CHART_LABELS.get(y_col)} 상관관계")
+    
+    return chart.interactive()
+
+def _plot_metric_histogram(df: pd.DataFrame, col: str):
+    """지표의 분포 확인 (히스토그램)"""
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X(f"{col}:Q", bin=alt.Bin(maxbins=30), title=METRIC_CHART_LABELS.get(col, col)),
+        y=alt.Y('count()', title='대학 수'),
+        color=alt.value("#636EFA")
+    ).properties(height=300, title=f"{METRIC_CHART_LABELS.get(col)} 분포")
+    return chart
+
+def _plot_group_box_plot(df: pd.DataFrame, group_col: str, val_col: str):
+    """그룹별 편차 확인 (박스플롯)"""
+    chart = alt.Chart(df).mark_boxplot(extent='min-max').encode(
+        x=alt.X(f"{group_col}:N", title=group_col),
+        y=alt.Y(f"{val_col}:Q", title=METRIC_CHART_LABELS.get(val_col, val_col)),
+        color=f"{group_col}:N"
+    ).properties(height=400, title=f"{group_col}별 {METRIC_CHART_LABELS.get(val_col)} 편차")
+    return chart
+
+# --- 데이터 로드 및 병합 ---
+@st.cache_data
+def load_and_merge_data():
+    output_dir = BASE_PATH / "output"
+    df_adm = _read_csv(output_dir / "2024_data.csv")
+    df_adm_sum = df_adm.groupby("학교명").agg({
+        "학과수_전체": "sum",
+        "입학정원_내_계": "sum", # 파일 컬럼명 확인 필요
+        "정원내_입학자_학부_계": "sum"
+    }).reset_index()
+    df_adm_sum = df_adm_sum.rename(columns={
+        "학과수_전체": "학과수", 
+        "입학정원_내_계": "입학정원",
+        "정원내_입학자_학부_계": "입학자_학부"
+        })
+
+    # 대학 마스터 정보 (학제, 설립, 지역 등 추출용)
+    df_master = df_adm[["학교명", "학제별", "설립별", "지역별"]].drop_duplicates("학교명")
+
+    df_tuition = _read_csv(output_dir / "한국장학재단_대학별 평균등록금_20250519.csv")
+    df_tuition.columns = [c.replace('"', '').strip() for c in df_tuition.columns]
+    df_tuition = df_tuition.rename(columns={"대학명": "학교명"})
+
+    df_scholarship = _read_csv(output_dir / "한국장학재단_대학별 장학금 수혜 현황_20250831.csv")
+    df_scholarship.columns = [c.replace('"', '').strip() for c in df_scholarship.columns]
+    df_scholarship = df_scholarship.rename(columns={
+        "교외장학금 소계(원)": "교외장학금",
+        "교내장학금 소계(원)": "교내장학금",
+        "총계(원)": "장학금_총계",
+    })
+
+    merged = pd.merge(df_master, df_adm_sum, on="학교명", how="inner")
+    merged = pd.merge(merged, df_tuition, on="학교명", how="left")
+    merged = pd.merge(merged, df_scholarship[["학교명", "교외장학금", "교내장학금", "장학금_총계"]], on="학교명", how="left")
+
+    return fix_count_columns(merged, COUNT_COLS)
+
+# --- 메인 로직 ---
+df_raw = load_and_merge_data()
+
+if not df_raw.empty:
+    # 1. 파생 지표 계산
+    df = df_raw[df_raw["입학정원"] > 0].copy()
+    for c in AMOUNT_COLS:
+        df[c] = _clean_to_numeric(df[c])
+    
+    enrolled = _clean_to_numeric(df["입학자_학부"])
+    quota = _clean_to_numeric(df["입학정원"])
+    scholar_total = _clean_to_numeric(df["장학금_총계"])
+    tuition_avg = _clean_to_numeric(df["평균등록금(원)"])
+
+    df["인당장학금"] = (scholar_total / enrolled.where(enrolled > 0)).fillna(0).round(0)
+    df["입학률"] = (enrolled / quota * 100).round(2)
+    df["실질부담금"] = (tuition_avg - df["인당장학금"]).round(0)
+
+    st.title("🎓 대학 IR Intelligence 분석 프로")
+    
+    # 상단 요약 지표 (기존 display_metrics 로직 대체/강화)
+    tabs_main = st.tabs(["📊 통합 대시보드", "🔍 상세 상관분석", "📈 분포 및 편차"])
+
+    with tabs_main[0]:
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("총 분석 대학", f"{len(df)}개")
+        col2.metric("평균 입학률", f"{df['입학률'].mean():.1f}%")
+        col3.metric("평균 등록금", f"{df['평균등록금(원)'].mean()/10000:.0f}만원")
+        col4.metric("평균 인당 장학금", f"{df['인당장학금'].mean()/10000:.0f}만원")
+        
+        st.divider()
+        # 필터 섹션
+        c1, c2, c3 = st.columns(3)
+        sel_region = c1.multiselect("지역 선택", sorted(df["지역별"].unique()), default=[])
+        sel_estab = c2.multiselect("설립 선택", sorted(df["설립별"].unique()), default=[])
+        sel_degree = c3.multiselect("학제 선택", sorted(df["학제별"].unique()), default=[])
+
+        f_df = df.copy()
+        if sel_region: f_df = f_df[f_df["지역별"].isin(sel_region)]
+        if sel_estab: f_df = f_df[f_df["설립별"].isin(sel_estab)]
+        if sel_degree: f_df = f_df[f_df["학제별"].isin(sel_degree)]
+
+        st.dataframe(f_df[["학교명", "지역별", "설립별", "입학률", "평균등록금(원)", "인당장학금", "실질부담금"]], 
+                     hide_index=True, use_container_width=True)
+
+    with tabs_main[1]:
+        st.subheader("지표 간 상관관계 분석")
+        sc1, sc2 = st.columns([1, 3])
+        with sc1:
+            x_axis = st.selectbox("X축 지표", ["입학정원", "평균등록금(원)", "학과수"], index=1)
+            y_axis = st.selectbox("Y축 지표", ["인당장학금", "입학률", "실질부담금", "장학금_총계"], index=0)
+            st.info("산점도를 통해 두 지표 간의 인과관계나 경향성을 파악할 수 있습니다.")
+        
+        with sc2:
+            scatter_chart = _plot_correlation_scatter(f_df, x_axis, y_axis)
+            st.altair_chart(scatter_chart, use_container_width=True)
+
+    with tabs_main[2]:
+        st.subheader("지표 분포 및 그룹별 비교")
+        dist_col, box_col = st.columns(2)
+        
+        selected_target = st.selectbox("분석 대상 지표 선택", ["평균등록금(원)", "인당장학금", "입학률", "실질부담금"])
+        
+        with dist_col:
+            st.altair_chart(_plot_metric_histogram(f_df, selected_target), use_container_width=True)
+        
+        with box_col:
+            group_target = st.radio("비교 그룹", ["지역별", "설립별", "학제별"], horizontal=True)
+            st.altair_chart(_plot_group_box_plot(f_df, group_target, selected_target), use_container_width=True)
+
+else:
+    st.error("데이터를 로드할 수 없습니다.")
+추가된 분석 기능 상세 설명
+입학률(Enrollment Rate) 분석:
+
+입학자 수 / 입학정원을 통해 해당 대학의 선호도와 정원 충족 효율성을 분석합니다. IR 분석에서 가장 기초가 되는 지표입니다.
+
+실질 부담금(Net Tuition) 지표:
+
+평균 등록금 - 인당 장학금을 계산하여, 학생이 실제로 체감하는 교육비용을 산출합니다. 이는 대학의 가격 경쟁력을 파악하는 데 유용합니다.
+
+상관관계 산점도 (Scatter Plot):
+
+예: "등록금이 비싼 대학이 장학금을 더 많이 주는가?" 혹은 "입학정원이 큰 대학이 입학률이 높은가?"와 같은 가설을 시각적으로 검증할 수 있습니다.
+
+색상과 모양을 통해 설립별(국공립/사립), 학제별(대학/전문대) 차이를 동시에 볼 수 있습니다.
+
+히스토그램 (Histogram):
+
+우리나라 대학들의 등록금이 특정 구간에 얼마나 몰려 있는지, 장학금 혜택이 상향 평준화되어 있는지 등의 데이터 분포 밀도를 확인할 수 있습니다.
+
+박스플롯 (Box Plot):
+
+단순 평균만 보는 것이 아니라, 지역별/설립별로 지표의 편차(최대, 최소, 중앙값, 이상치)를 확인할 수 있습니다.
+
+예를 들어, 수도권 대학과 비수도권 대학 간의 등록금 격차나 편차 범위를 한눈에 비교하기에 가장 좋은 그래프입니다.
+
+사용 방법
+상세 상관분석 탭: 좌측에서 X축과 Y축 지표를 바꾸어 가며 대학들의 포지셔닝을 확인하세요.
+
+분포 및 편차 탭: 특정 지표(예: 인당 장학금)가 지역별로 얼마나 균등하게 혹은 불균형하게 분포되어 있는지 확인하세요. 그래프 하단의 라디오 버튼으로 그룹 기준을 즉시 변경할 수 있습니다.
+
+위 데이터를 이용하여 총장관점에서 꼭 필요한 분석을 할 수있는 기능의 프로그램을 생성해 주세요. 다양한 지표 및 통계 기법, 시각화 기능을 활용해야 합니다.
+
+총장(CEO)의 관점에서 대학 경영의 핵심은 "지속 가능한 성장", "재정 건전성", 그리고 "교육 경쟁력(브랜드 가치)"입니다.
+
+단순한 현황 파악을 넘어, 타 대학 대비 우리 대학의 위치를 파악하고 전략적 의사결정을 내릴 수 있도록 [총장용 IR 전략 의사결정 지원 시스템] 프로그램을 작성해 드립니다.
+
+핵심 분석 로직
+경쟁력 지표(Recruitment Power): 신입생 충원율 및 입학 정원 규모 분석
+
+재정 건전성(Financial Health): 실질 등록금 수입(Net Revenue) 및 장학금 지급 효율성
+
+포트폴리오 분석(Strategic Positioning): 대학의 규모와 재정 지원의 상관관계 분석
+
+리스크 모니터링: 동종 그룹(설립별/지역별) 내에서 하위권에 위치한 지표 식별
+
+Python
+import streamlit as st
+import pandas as pd
+import altair as alt
+import plotly.express as px
+import plotly.graph_objects as go
+from pathlib import Path
+
+# --- 페이지 설정 ---
+st.set_page_config(page_title="President's IR Decision Support System", layout="wide")
+
+# --- 스타일링 ---
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    h1, h2, h3 { color: #1e3a8a; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- 데이터 로드 함수 (캐싱 적용) ---
+@st.cache_data
+def load_strategic_data():
+    # 실제 환경에서는 유저가 올린 파일 경로에 맞게 수정 필요
+    base_path = Path(__file__).resolve().parent.parent / "output"
+    
+    # 1. 입시 데이터
+    df_adm = pd.read_csv(base_path / "2024_data.csv", encoding='utf-8-sig') # 혹은 cp949
+    df_adm_sum = df_adm.groupby("학교명").agg({
+        "학과수_전체": "sum",
+        "입학정원_내_계": "sum",
+        "정원내_입학자_학부_계": "sum",
+        "지역별": "first",
+        "설립별": "first",
+        "학제별": "first"
+    }).reset_index()
+
+    # 2. 등록금 및 장학금
+    df_tuition = pd.read_csv(base_path / "한국장학재단_대학별 평균등록금_20250519.csv", encoding='cp949')
+    df_tuition.columns = [c.replace('"', '').strip() for c in df_tuition.columns]
+    
+    df_scholar = pd.read_csv(base_path / "한국장학재단_대학별 장학금 수혜 현황_20250831.csv", encoding='cp949')
+    df_scholar.columns = [c.replace('"', '').strip() for c in df_scholar.columns]
+
+    # 병합
+    merged = pd.merge(df_adm_sum, df_tuition[["대학명", "평균등록금(원)"]], left_on="학교명", right_on="대학명", how="inner")
+    merged = pd.merge(merged, df_scholar[["학교명", "총계(원)"]], on="학교명", how="left")
+    
+    # 전처리 및 핵심 KPI 계산
+    merged = merged.rename(columns={"입학정원_내_계": "입학정원", "정원내_입학자_학부_계": "입학자", "총계(원)": "장학금총계"})
+    merged['충원율'] = (merged['입학자'] / merged['입학정원'] * 100).round(2)
+    merged['인당장학금'] = (merged['장학금총계'] / merged['입학자']).fillna(0)
+    merged['실질등록금'] = merged['평균등록금(원)'] - merged['인당장학금']
+    merged['재정부담율'] = (merged['장학금총계'] / (merged['평균등록금(원)'] * merged['입학자']) * 100).round(2)
+    
+    return merged
+
+# --- 메인 대시보드 ---
+def main():
+    st.title("🏛️ 총장용 IR 전략 의사결정 지원 시스템")
+    st.subheader("University Strategic Intelligence Dashboard")
+
+    try:
+        df = load_strategic_data()
+    except Exception as e:
+        st.error(f"데이터를 불러오는 중 오류가 발생했습니다: {e}")
+        return
+
+    # --- 사이드바 필터 (전략적 그룹핑) ---
+    st.sidebar.header("전략 분석 그룹 설정")
+    selected_regions = st.sidebar.multiselect("분석 지역", options=sorted(df['지역별'].unique()), default=df['지역별'].unique())
+    selected_estabs = st.sidebar.multiselect("설립 유형", options=df['설립별'].unique(), default=df['설립별'].unique())
+    
+    f_df = df[(df['지역별'].isin(selected_regions)) & (df['설립별'].isin(selected_estabs))]
+
+    # --- 탭 구성 ---
+    tab1, tab2, tab3, tab4 = st.tabs(["🚀 핵심 경영 지표", "📊 경쟁력 분석", "💰 재정 및 수익성", "📍 위치 분석(Matrix)"])
+
+    # --- Tab 1: 핵심 경영 지표 ---
+    with tab1:
+        st.write("### 핵심 성과 지표 (Strategic KPIs)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("분석 대상 대학 수", f"{len(f_df)}개")
+        c2.metric("평균 신입생 충원율", f"{f_df['충원율'].mean():.1f}%")
+        c3.metric("평균 실질 등록금", f"{f_df['실질등록금'].mean()/10000:.0f}만원")
+        c4.metric("재정 대비 장학금 비중", f"{f_df['재정부담율'].mean():.1f}%")
+
+        st.divider()
+        st.write("#### 설립유형별 충원율 및 재정지표 비교")
+        avg_stats = f_df.groupby('설립별').agg({
+            '충원율': 'mean',
+            '실질등록금': 'mean',
+            '인당장학금': 'mean'
+        }).reset_index()
+        
+        col_left, col_right = st.columns(2)
+        with col_left:
+            fig = px.bar(avg_stats, x='설립별', y='충원율', color='설립별', title="설립별 평균 충원율")
+            st.plotly_chart(fig, use_container_width=True)
+        with col_right:
+            fig = px.bar(avg_stats, x='설립별', y='인당장학금', title="설립별 평균 인당 장학금 지원액")
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --- Tab 2: 경쟁력 분석 ---
+    with tab2:
+        st.write("### 신입생 모집 경쟁력 진단")
+        
+        # 충원율 분포 분석 (통계적 이상치 확인)
+        fig = px.box(f_df, x='지역별', y='충원율', color='설립별', points="all",
+                     title="지역별 충원율 편차 및 이상치(위험대학) 분석")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.write("#### 충원율 하위 10개 대학 (집중 모니터링 대상)")
+        low_enroll = f_df.sort_values('충원율').head(10)[['학교명', '지역별', '입학정원', '입학자', '충원율']]
+        st.table(low_enroll)
+
+    # --- Tab 3: 재정 및 수익성 ---
+    with tab3:
+        st.write("### 재정 건전성 및 학생 부담 분석")
+        
+        # 실질 등록금 vs 장학금 상관관계
+        fig = px.scatter(f_df, x='평균등록금(원)', y='인당장학금', size='입학자', color='지역별',
+                         hover_name='학교명', trendline="ols",
+                         title="등록금 수준 대비 장학금 지급 전략 분석")
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.info("💡 회귀선보다 위에 위치한 대학은 등록금 대비 장학금 혜택이 매우 공격적인 대학이며, 아래는 학생의 실질 비용 부담이 높은 대학입니다.")
+
+    # --- Tab 4: 전략적 위치 분석 (Strategic Matrix) ---
+    with tab4:
+        st.write("### 전략적 포지셔닝 맵 (Competitor Matrix)")
+        
+        # X축: 충원율(경쟁력), Y축: 실질등록금(수익성), Size: 입학정원(규모)
+        fig = px.scatter(f_df, x='충원율', y='실질등록금', size='입학정원', color='설립별',
+                         hover_name='학교명', 
+                         labels={'충원율': '모집 경쟁력 (충원율 %)', '실질등록금': '재정 수익성 (실질 등록금)'},
+                         title="대학 전략 포지셔닝 매트릭스")
+        
+        # 평균선 추가 (사분면 분석)
+        fig.add_hline(y=f_df['실질등록금'].mean(), line_dash="dot", annotation_text="평균 수익성")
+        fig.add_vline(x=f_df['충원율'].mean(), line_dash="dot", annotation_text="평균 경쟁력")
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        with st.expander("🧐 매트릭스 해석 가이드"):
+            st.write("""
+            - **우상단 (Star)**: 높은 경쟁력과 높은 수익성을 동시에 확보한 대학 (이상적 모델)
+            - **우하단 (Cash Cow)**: 경쟁력은 높으나 장학금 지출이 많아 수익성이 낮은 대학 (수익 효율화 필요)
+            - **좌상단 (Niche)**: 규모는 작으나 특정 브랜드로 수익성을 유지하는 대학
+            - **좌하단 (At Risk)**: 경쟁력과 수익성이 모두 낮아 전략적 구조조정이 필요한 대학
+            """)
+
+# --- 프로그램 실행 ---
+if __name__ == "__main__":
+    main()
+이 프로그램이 총장님께 드리는 3가지 가치
+사분면 전략 매트릭스 (Strategic Matrix):
+
+우리 대학이 "학생은 많이 오는데 실속이 없는지(Cash Cow)" 아니면 "비싸기만 하고 아무도 안 오는지(Risk)"를 타 대학과 비교하여 즉각적으로 보여줍니다.
+
+이는 내년도 장학금 예산 편성이나 학과 구조 개편의 근거가 됩니다.
+
+실질 등록금(Net Tuition) 분석:
+
+표면적인 등록금이 아니라, 장학금을 뺀 "학생 1인당 실제로 우리 통장에 꽂히는 돈"을 계산합니다. 대학 경영의 실질 수익성을 판단하는 핵심 지표입니다.
+
+통계적 이상치 탐지 (Outlier Detection):
+
+박스플롯(Box plot) 기능을 통해 동일 지역/동일 설립 유형 내에서 우리 대학이 리스크 범주(하위 25% 이하)에 속해 있는지 통계적으로 검증해 줍니다.
+
+향후 확장 가능 기능
+시계열 예측: 과거 3개년 데이터를 연동하면 내년도 예상 충원율을 선형 회귀로 예측할 수 있습니다.
+
+정부 지원금 연동: 공시 데이터의 '정부 재정 지원 사업' 데이터를 연동하면 대학의 외부 자산 유치 역량까지 통합 분석이 가능합니다.
+
+이 프로그램은 대학 경영의 '숫자' 뒤에 숨겨진 전략적 의미를 총장의 눈높이에서 보여주는 강력한 도구가 될 것입니다. 코드 실행을 위해 필요한 라이브러리(streamlit, pandas, plotly, altair, statsmodels)를 설치한 후 바로 활용해 보십시오.
+
+# -*- coding: utf-8 -*-
+
+"""
+
+DataSense DQ Profiling System
+
+Qliker, 2026.01.02 Version 2.0
+
+"""
+
+
+
+import os
+
+import re
+
+import sys
+
+import yaml
+
+import time
+
+import json
+
+import traceback
+
+import logging
+
+import numpy as np
+
+import pandas as pd
+
+from datetime import datetime
+
+from pathlib import Path
+
+from multiprocessing import Pool, cpu_count
+
+from collections import Counter
+
+
+
+#---------------------------------------------------------------
+
+# Path & Directory 설정
+
+#---------------------------------------------------------------
+
+
+
+if getattr(sys, 'frozen', False):  # A. 실행파일(.exe) 상태일 때: .exe 파일이 있는 위치가 루트입니다.
+
+    ROOT_PATH = Path(sys.executable).parent
+
+else:  # B. 소스코드(.py) 상태일 때: 현재 파일(util/..)의 상위 폴더가 루트입니다.  
+
+    ROOT_PATH = Path(__file__).resolve().parents[1]
+
+
+
+if str(ROOT_PATH) not in sys.path: # # 시스템 경로에 루트 추가 (어디서 실행해도 모듈을 찾을 수 있게 함)
+
+    sys.path.insert(0, str(ROOT_PATH))
+
+
+
+# ---------------------------------------------------------------
+
+# [2. 모듈 Import] 어떤 환경에서도 에러 없이 불러오도록 예외 처리
+
+# ---------------------------------------------------------------
+
+# from util.DS_Columnprofiler import ColumnProfiler, Get_Oracle_Type, Determine_Detail_Type, add_dq_scores
+
+from util.DS_Columnprofiler import ColumnProfiler, add_dq_scores
+
+
+
+META_PATH = ROOT_PATH / 'DS_Meta' / 'CodeList_Meta.csv'
+
+OUTPUT_DIR = ROOT_PATH / 'DS_Output'
+
+FORMAT_FILE = OUTPUT_DIR / 'FileFormat.csv'
+
+STATS_FILE = OUTPUT_DIR / 'FileStats.csv'
+
+SAMPLE_ROWS = 10000
+
+FORMAT_MAX_VALUE = 10000
+
+
+
+def normalize_path(path_str):
+
+    if path_str is None or str(path_str).strip() == "":
+
+        return path_str
+
+    path_str = os.path.expanduser(os.path.expandvars(str(path_str)))
+
+    if not os.path.isabs(path_str):
+
+        path_str = str((ROOT_PATH / path_str).resolve())
+
+    else:
+
+        path_str = str(Path(path_str).resolve())
+
+    return path_str.replace('\\', '/')
+
+
+
+#---------------------------------------------------------------
+
+# MasterCodeFormatEngine Class
+
+#---------------------------------------------------------------
+
+class MasterCodeFormatEngine:
+
+    def __init__(self, chunk_size=100000, large_file_threshold_mb=500):
+
+        """
+
+        Args:
+
+            chunk_size: 청크 단위 처리 시 한 번에 읽을 행 수 (기본값: 100000)
+
+            large_file_threshold_mb: 대용량 파일 판단 기준 (MB, 기본값: 500MB)
+
+                                    작은 파일은 청크 처리하지 않아 더 빠름
+
+        """
+
+        self.output_path = OUTPUT_DIR
+
+        self.SAMPLE_ROWS = 10000
+
+        self.chunk_size = chunk_size
+
+        self.large_file_threshold_mb = large_file_threshold_mb
+
+
+
+    def _get_file_size_mb(self, file_path):
+
+        """파일 크기를 MB 단위로 반환"""
+
+        try:
+
+            size_bytes = os.path.getsize(file_path)
+
+            return size_bytes / (1024 * 1024)
+
+        except Exception:
+
+            return 0
+
+   
+
+    def _is_large_file(self, file_path):
+
+        """대용량 파일 여부 판단 (최적화: 작은 파일은 빠르게 제외)"""
+
+        try:
+
+            # 파일 크기 체크를 최적화: 작은 파일은 즉시 False 반환
+
+            size_bytes = os.path.getsize(file_path)
+
+            size_mb = size_bytes / (1024 * 1024)
+
+            return size_mb > self.large_file_threshold_mb
+
+        except Exception:
+
+            return False
+
+
+
+    def load_source_file(self, file_path, ext) -> pd.DataFrame:
+
+        """ 소스 파일 읽기 (작은 파일용) """
+
+        # ext . 이 있으면 제거하고, 소문자로 변환하여 extension 변수에 저장, source 는 변환하지 않음
+
+        extension = str(ext.lower().strip('.'))
+
+        file_ext = str(os.path.splitext(file_path)[1]).lower().strip('.')
+
+
+
+        encoding_list = ['utf-8-sig', 'utf-8', 'cp949', 'euc-kr']
+
+
+
+        # extension 이 all 이나, 지정하지 않거나 파일의 extension이 동일하면 파일을 읽어서 처리함.
+
+        if file_ext == extension or extension == '' or extension == 'all':
+
+            try:
+
+                if file_ext == 'csv':
+
+                    for encoding in encoding_list:
+
+                        try:
+
+                            df = pd.read_csv(file_path, dtype=str, low_memory=False, encoding=encoding)
+
+                            return df
+
+                        except Exception as e:
+
+                            continue
+
+                    return None
+
+                elif file_ext == 'xlsx':
+
+                    df = pd.read_excel(file_path, dtype=str)
+
+                    return df
+
+                elif file_ext == 'pkl':
+
+                    df = pd.read_pickle(file_path)
+
+                    return df
+
+
+
+                return None
+
+            except Exception as e:
+
+                print(f"메타 파일 점검 : 파일 읽기 실패: {file_path}, 오류: {e}")
+
+                return None
+
+   
+
+    def _process_large_file_chunked(self, file_path, ext, m_type='Master', file_no=1):
+
+        """대용량 파일을 청크 단위로 처리 (최적화: 샘플만 수집, 불필요한 복사 제거)"""
+
+        col_results = []
+
+        file_ext = str(os.path.splitext(file_path)[1]).lower().strip('.')
+
+        encoding_list = ['utf-8-sig', 'utf-8', 'cp949', 'euc-kr']
+
+       
+
+        if file_ext != 'csv':
+
+            # CSV가 아니면 기존 방식 사용
+
+            return self._process_file_normal(file_path, ext, m_type)
+
+       
+
+        # CSV 파일 청크 단위 처리 (최적화: 샘플만 수집)
+
+        sampled_chunks = []
+
+        encoding_used = None
+
+        column_cnt = 0
+
+       
+
+        # 인코딩 확인 및 첫 청크에서 컬럼 정보 얻기 (최적화: 첫 청크 재사용)
+
+        for encoding in encoding_list:
+
+            try:
+
+                test_chunk = pd.read_csv(file_path, nrows=100, dtype=str, encoding=encoding, low_memory=False)
+
+                encoding_used = encoding
+
+                column_cnt = len(test_chunk.columns)
+
+                break
+
+            except Exception:
+
+                continue
+
+       
+
+        if encoding_used is None:
+
+            print(f"메타 파일 점검 : 파일 인코딩 확인 실패: {file_path}")
+
+            return [], []
+
+       
+
+        # 청크 단위로 읽으면서 샘플 수집 (최적화: 필요한 샘플만 수집, .copy() 제거)
+
+        try:
+
+            chunk_reader = pd.read_csv(file_path, chunksize=self.chunk_size, dtype=str,
+
+                                     encoding=encoding_used, low_memory=False)
+
+           
+
+            accumulated_samples = 0
+
+            total_rows = 0
+
+            for chunk_idx, chunk in enumerate(chunk_reader):
+
+                chunk_rows = len(chunk)
+
+                total_rows += chunk_rows
+
+               
+
+                # 필요한 샘플만 수집 (SAMPLE_ROWS에 도달하면 중단)
+
+                remaining_samples = self.SAMPLE_ROWS - accumulated_samples
+
+                if remaining_samples > 0:
+
+                    chunk_sample_size = min(chunk_rows, remaining_samples)
+
+                    if chunk_sample_size > 0:
+
+                        if chunk_rows <= chunk_sample_size:
+
+                            # 전체 청크가 필요하면 그대로 사용 (복사 제거)
+
+                            sampled_chunks.append(chunk)
+
+                            accumulated_samples += chunk_rows
+
+                        else:
+
+                            # 샘플링만 수행 (복사 제거)
+
+                            sampled_chunks.append(chunk.sample(n=chunk_sample_size, random_state=42))
+
+                            accumulated_samples += chunk_sample_size
+
+                else:
+
+                    # 필요한 샘플을 모두 수집했으면 청크 읽기 중단
+
+                    # pandas chunksize는 전체 파일을 읽어야 하지만,
+
+                    # 실제로는 샘플 수집 후에는 더 이상 처리할 필요 없음
+
+                    # 하지만 chunksize는 전체를 읽어야 하므로 break는 불가능
+
+                    # 대신 나머지 청크는 빠르게 건너뛰기
+
+                    pass
+
+           
+
+            # 수집된 샘플들을 합쳐서 프로파일링
+
+            actual_sample_size = 0
+
+            if sampled_chunks:
+
+                sample_df = pd.concat(sampled_chunks, ignore_index=True)
+
+                actual_sample_size = len(sample_df)
+
+               
+
+                # 컬럼별 프로파일링
+
+                for col in sample_df.columns:
+
+                    try:
+
+                        res = ColumnProfiler(sample_df, col, actual_sample_size).profile()
+
+                        if res:
+
+                            res.update({
+
+                                'MasterType': m_type,
+
+                                'FileName': os.path.basename(file_path),
+
+                                'FilePath': normalize_path(file_path),
+
+                                'RecordCnt': total_rows  # 전체 레코드 수 사용
+
+                            })
+
+                            col_results.append(res)
+
+                    except Exception as e:
+
+                        print(f"컬럼 프로파일링 실패 (파일: {file_path}, 컬럼: {col}): {e}")
+
+                        continue
+
+        except Exception as e:
+
+            print(f"청크 단위 파일 처리 실패: {file_path}, 오류: {e}")
+
+            return [], []
+
+       
+
+        # SamplingRows와 Sampling(%) 계산
+
+        sampling_pct = round((actual_sample_size / total_rows * 100) if total_rows > 0 else 0, 2)
+
+       
+
+        file_stats = [{
+
+            'FileNo': file_no,
+
+            'FilePath': normalize_path(file_path),
+
+            'FileName': os.path.basename(file_path),
+
+            'MasterType': m_type,
+
+            'RecordCnt': total_rows,
+
+            'ColumnCnt': column_cnt,
+
+            'SamplingRows': actual_sample_size,
+
+            'Sampling(%)': sampling_pct,
+
+            'FileSize': self._get_file_size_mb(file_path),
+
+            'WorkDate': datetime.now().strftime('%Y-%m-%d')
+
+        }]
+
+       
+
+        return col_results, file_stats
+
+   
+
+    def _process_file_normal(self, file_path, ext, m_type='Master', file_no=1):
+
+        """일반 파일 처리 (기존 방식 - 최적화: 불필요한 복사 제거)"""
+
+        col_results, file_stats = [], []
+
+       
+
+        df = self.load_source_file(file_path, ext)
+
+        if df is None:
+
+            return [], []
+
+       
+
+        total_rows = len(df)
+
+        sample_rows = min(total_rows, self.SAMPLE_ROWS)
+
+        # 샘플링이 필요하면 샘플링, 아니면 원본 사용 (복사 제거)
+
+        if total_rows <= self.SAMPLE_ROWS:
+
+            sample_df = df
+
+        else:
+
+            sample_df = df.sample(n=self.SAMPLE_ROWS, random_state=42)
+
+       
+
+        # SamplingRows와 Sampling(%) 계산
+
+        actual_sample_size = len(sample_df)
+
+        sampling_pct = round((actual_sample_size / total_rows * 100) if total_rows > 0 else 0, 2)
+
+       
+
+        file_stats.append({
+
+            'FileNo': file_no,
+
+            'FilePath': normalize_path(file_path),
+
+            'FileName': os.path.basename(file_path),
+
+            'MasterType': m_type,
+
+            'RecordCnt': total_rows,
+
+            'ColumnCnt': len(df.columns),
+
+            'SamplingRows': actual_sample_size,
+
+            'Sampling(%)': sampling_pct,
+
+            'FileSize': self._get_file_size_mb(file_path),
+
+            'WorkDate': datetime.now().strftime('%Y-%m-%d')
+
+        })
+
+       
+
+        # 컬럼별 프로파일링
+
+        for col in sample_df.columns:
+
+            try:
+
+                res = ColumnProfiler(sample_df, col, sample_rows).profile()
+
+                if res:
+
+                    res.update({
+
+                        'MasterType': m_type,
+
+                        'FileName': os.path.basename(file_path),
+
+                        'FilePath': normalize_path(file_path)
+
+                    })
+
+                    col_results.append(res)
+
+            except Exception as e:
+
+                print(f"컬럼 프로파일링 실패 (파일: {file_path}, 컬럼: {col}): {e}")
+
+                continue
+
+       
+
+        return col_results, file_stats
+
+
+
+    def run_profile(self, m_type, source, ext):
+
+        """
+
+        m_type: Master, Reference, Rule
+
+        source: 파일 경로
+
+        ext: 파일 확장자
+
+        """
+
+
+
+        col_results, file_stats = [], []
+
+        try:
+
+            target_files = []
+
+            try:
+
+                source_path = normalize_path(source)
+
+                if not os.path.exists(source_path):
+
+                    print(f"메타 파일 점검 : 경로가 존재하지 않습니다: {source_path}")
+
+                    return [], []
+
+               
+
+                if os.path.isdir(source_path):
+
+                    for f in os.listdir(source_path):
+
+                        if f.lower().endswith(ext):
+
+                            target_files.append(os.path.join(source_path, f))
+
+                else:
+
+                    target_files.append(source_path)
+
+            except Exception as e:
+
+                print(f"메타 파일 점검 : 파일 목록 조회 오류 (경로: {source_path}): {e}")
+
+                return [], []
+
+
+
+            if not target_files:
+
+                print(f"메타 파일 점검 : 처리할 파일이 없습니다 (경로: {source_path}, 확장자: {ext})")
+
+                return [], []
+
+
+
+            for file_no, f_path in enumerate(target_files, start=1):
+
+                try:                    
+
+                    # 대용량 파일 여부 확인 (최적화: 파일 크기 체크 최소화)
+
+                    file_size_mb = self._get_file_size_mb(f_path)
+
+                    if file_size_mb > self.large_file_threshold_mb:
+
+                        print(f"대용량 파일 감지 (청크 처리): {os.path.basename(f_path)} ({file_size_mb:.1f}MB)")
+
+                        file_col_results, file_file_stats = self._process_large_file_chunked(f_path, ext, m_type, file_no)
+
+                        col_results.extend(file_col_results)
+
+                        file_stats.extend(file_file_stats)
+
+                    else:
+
+                        # 일반 파일 처리 (기존 방식 - 더 빠름)
+
+                        file_col_results, file_file_stats = self._process_file_normal(f_path, ext, m_type, file_no)
+
+                        col_results.extend(file_col_results)
+
+                        file_stats.extend(file_file_stats)
+
+                       
+
+                except Exception as e:
+
+                    print(f"파일 처리 실패: {f_path}, 오류: {e}")
+
+                    print(traceback.format_exc())
+
+                    continue
+
+                   
+
+        except Exception as e:
+
+            print(f"run_profile 전체 오류: {e}")
+
+       
+
+        return col_results, file_stats
+
+
+
+    def Profiling(self, source_list):
+
+        """source_list의 모든 항목에 대해 프로파일링을 수행하고 결과를 저장합니다."""
+
+        try:
+
+            if not source_list:
+
+                print("처리할 파일 목록이 비어있습니다.")
+
+                return False
+
+           
+
+            # 멀티프로세싱 또는 순차 처리로 모든 source 처리
+
+            try:
+
+                with Pool(cpu_count()) as pool:
+
+                    # run_profile을 멀티프로세싱으로 실행하기 위해 래퍼 함수 필요
+
+                    # 현재는 순차 처리로 구현
+
+                    combined = []
+
+                    for item in source_list:
+
+                        col_results, file_stats = self.run_profile(item['type'], item['source'], item['extension'])
+
+                        combined.append((col_results, file_stats))
+
+            except Exception as e:
+
+                print(f"멀티프로세싱 오류: {e}")
+
+                print("순차 처리로 전환")
+
+                combined = []
+
+                for item in source_list:
+
+                    col_results, file_stats = self.run_profile(item['type'], item['source'], item['extension'])
+
+                    combined.append((col_results, file_stats))
+
+           
+
+            # 결과 수집
+
+            flat_cols, flat_file_stats = [], []
+
+            for col_results, file_stats in combined:
+
+                if col_results:
+
+                    flat_cols.extend(col_results)
+
+                if file_stats:
+
+                    flat_file_stats.extend(file_stats)
+
+           
+
+            print(f"총 {len(flat_cols)}개 컬럼 결과 수집 완료")
+
+           
+
+            if not flat_cols:
+
+                print("처리된 컬럼 결과가 없습니다.")
+
+                return False
+
+           
+
+            # DataFrame 변환
+
+            final_df = pd.DataFrame(flat_cols)
+
+            print(f"수행 결과 완료: {len(final_df)}행 x {len(final_df.columns)}열")
+
+
+
+            # DQ 점수 추가
+
+            try:
+
+                final_df = add_dq_scores(final_df)
+
+            except Exception as e:
+
+                print(f"DQ 점수 추가 실패 (계속 진행): {e}")
+
+           
+
+            # FileFormat_2.csv 헤더 규격 강제 적용
+
+            cols_spec = [
+
+                'FilePath', 'FileName', 'ColumnName', 'MasterType', 'PK', 'DataType', 'OracleType', 'DetailDataType',
+
+                'LenCnt', 'LenMin', 'LenMax', 'LenAvg', 'LenMode', 'RecordCnt', 'SampleRows',
+
+                'ValueCnt', 'NullCnt', 'Null(%)', 'UniqueCnt', 'Unique(%)', 'FormatCnt',
+
+                'Format', 'FormatValue', 'Format(%)', 'Format2nd', 'Format2ndValue', 'Format2nd(%)',
+
+                'Format3rd', 'Format3rdValue', 'Format3rd(%)', 'FormatTop10', 'FormatTopRate', 'MinString', 'MaxString',
+
+                'ModeString', 'MedianString', 'ModeCnt', 'Mode(%)', 'FormatMin', 'FormatMax',
+
+                'FormatMode', 'FormatMedian', 'Format2ndMin', 'Format2ndMax', 'Format2ndMode',
+
+                'Format2ndMedian', 'Format3rdMin', 'Format3rdMax', 'Format3rdMode', 'Format3rdMedian'
+
+            ]
+
+            ordered = [c for c in cols_spec if c in final_df.columns]
+
+            ordered += [c for c in final_df.columns if c not in ordered]
+
+           
+
+            # 결과 저장
+
+            try:
+
+                self.output_path.mkdir(parents=True, exist_ok=True)
+
+                save_path = FORMAT_FILE
+
+               
+
+                final_df[ordered].to_csv(save_path, index=False, encoding='utf-8-sig')
+
+                print(f"수행 결과 저장: {save_path}")
+
+
+
+                # flat_file_stats 사용 (누적된 파일 통계 데이터)
+
+                if flat_file_stats:
+
+                    file_stats_df = pd.DataFrame(flat_file_stats)
+
+                    file_stats_df.to_csv(STATS_FILE, index=False, encoding='utf-8-sig')
+
+                    print(f"파일 통계 결과 저장: {STATS_FILE} ({len(file_stats_df)}행)")
+
+                else:
+
+                    print("파일 통계 데이터가 없어 저장하지 않습니다.")
+
+                return True
+
+            except Exception as e:
+
+                print(f"파일 저장 실패: {save_path}, 오류: {e}")
+
+                print(traceback.format_exc())
+
+                return False
+
+               
+
+        except Exception as e:
+
+            print(f"Profiling 오류: {e}")
+
+            print(traceback.format_exc())
+
+            return False
+
+
+
+#-----------------------------------------------------------------------
+
+# Load CodeMapping File ( CodeFormat을 수행할 Source Folder Path )
+
+#-----------------------------------------------------------------------
+
+def load_codemapping_validate() -> list[dict]:
+
+        try:    
+
+            print(f"META_PATH: {META_PATH}")
+
+            source_list = pd.read_csv(META_PATH)
+
+            # source_list의 필수 컬럼 점검  ( execution_flag,type, source, extension 존재 여부)
+
+            required_columns = ['execution_flag', 'type', 'source', 'extension']
+
+            for col in required_columns:
+
+                if col not in source_list.columns:
+
+                    print(f"{META_PATH} 파일 구조 점검 : {col} 컬럼이 없습니다.")
+
+                    return []
+
+           
+
+            filtered = source_list[source_list['execution_flag'] == 'Y']
+
+            if filtered.empty:
+
+                print(f"수행할 폴더가 없습니다.")
+
+                return []
+
+
+
+            # # meta 파일에서 type이 Master, Reference, Rule 인 경우만 수행
+
+            # if not filtered['type'].isin(['Master', 'Reference', 'Rule']).all():
+
+            #     print(f"meta 파일에서 type이 Master, Reference, Rule 이 아닌 경우는 수행하지 않습니다.")
+
+            #     return []
+
+
+
+            print(f"수행할 폴더 수: {len(filtered)} 개 ")
+
+            return filtered.to_dict(orient='records')
+
+        except Exception as e:
+
+            print(f"{META_PATH} 파일 점검 : 메타데터 파일 읽기 실패: {e}")
+
+            return []
+
+#-----------------------------------------------------------------------
+
+# Main
+
+#-----------------------------------------------------------------------
+
+def main():
+
+    """
+
+    DataSense Data Profiling 메인 함수
+
+    """
+
+    start_time = time.time()
+
+   
+
+    try:
+
+        print("=" * 60)
+
+        print("DataSense Data Profiling 시작")
+
+        print("=" * 60)
+
+               
+
+        source_list = load_codemapping_validate()
+
+        if  source_list is None or len(source_list) == 0:
+
+            print(f"메타 파일 점검 : {META_PATH}")
+
+            return None
+
+       
+
+        # MasterCodeFormatEngine 엔진 실행
+
+        # engine = MasterCodeFormatEngine_new()  
+
+        engine = MasterCodeFormatEngine(large_file_threshold_mb=1000)  # 1GB 이상만 청크 처리
+
+        engine.Profiling(source_list)
+
+                   
+
+        end_time = time.time()
+
+        processing_time = end_time - start_time
+
+        print("=" * 60)
+
+        print(f"총 처리 시간: {processing_time:.2f}초")
+
+        print("=" * 60)
+
+       
+
+    except Exception as e:
+
+        print(f"MasterCodeFormat 오류 발생: {e}")
+
+        return None
+
+
+
+if __name__ == "__main__":
+
+    # 단독 실행 모드
+
+    result = main()
+
+현재의 프로그램은 DS_Meta/CodeList_Meta.csv 파일을 읽어서 해당 폴더의 모든 파일을 읽어 처리하는 로직입니다. 현재는 csv 파일을 처리하는 로직인데 이를 개선하고자 합니다.
+
+특히 Profiling 함수에서 소스의 파일을 읽는 부분 및 처리하는 부분이 함께 들어있는데 이를 모듈 단위로 나누고자 합니다.
+
+데이터 입력 부분
+
+데이터 처리 부분
+
+결과를 받아서 최종 결과 피일 저장 부분
+
+위 부분들을 향 후 데이터베이스를 읽어서 처리할 수 있도록하고, 저장부분도 데이터베이스에 저장할 수 있는 기능들을 추가하고자 합니다. 즉 데이터 처리부분은 변경이 없고 입력부분, 저장부분만 수정하여 사용할 수 있도록 모듈을 모두 분리해주세요
+
+제시해주신 코드는 대용량 및 일반 데이터 파일에 대해 기초 통계량, 데이터 타입 분석, 값 패턴 분석 및 품질 점수(DQ Score)를 매기는 강력한 DataSense 핵심 프로파일링 엔진입니다.
+
+이를 요구사항에 맞게 (1) 데이터 입력(Reader), (2) 데이터 처리(Engine), (3) 결과 저장(Writer)으로 철저히 격리 및 모듈화하고, 향후 파일 외에 데이터베이스(DB) 환경으로 손쉽게 스위칭 및 확장할 수 있도록 추상 클래스(Interface) 기반의 구조로 전면 리팩토링한 코드를 제공해 드립니다.
+
+리팩토링 설계 핵심 요약
+BaseInputReader & BaseOutputWriter (추상 인터페이스)
+
+입력과 저장부를 추상화하여, 구조적 변경 없이 CSVReader, DatabaseReader 또는 CSVWriter, DatabaseWriter로 교체할 수 있도록 설계했습니다.
+
+MasterCodeFormatEngine (순수 처리 엔진)
+
+파일 경로나 DB 커넥션에 의존하지 않고, 오직 유입된 데이터프레임(pd.DataFrame)과 타겟 컬럼 리스트만을 제어하며 프로파일링 프로세스 자체에만 집중합니다.
+
+결합도 제거(Decoupling)
+
+원본 코드에서 Profiling 함수 내부에 복잡하게 얽혀 있던 파일 루프, 청크 샘플링 로직이 Reader 단위 내부로 깔끔히 격리되었습니다.
+
+고도화 및 모듈화된 전체 소스 코드
+Python
+# -*- coding: utf-8 -*-
+"""
+DataSense DQ Profiling System - Architecture Refactored
+Qliker, 2026.05.28 Version 3.0 (Modular & Extensible)
+"""
+
+import os
+import sys
+import time
+import traceback
+from datetime import datetime
+from pathlib import Path
+from abc import ABC, abstractmethod
+import pandas as pd
+from multiprocessing import Pool, cpu_count
+
+#---------------------------------------------------------------
+# Path & Directory 설정
+#---------------------------------------------------------------
+if getattr(sys, 'frozen', False): 
+    ROOT_PATH = Path(sys.executable).parent
+else:   
+    ROOT_PATH = Path(__file__).resolve().parents[1]
+
+if str(ROOT_PATH) not in sys.path:
+    sys.path.insert(0, str(ROOT_PATH))
+
+# ColumnProfiler 인터페이스 임포트
+from util.DS_Columnprofiler import ColumnProfiler, add_dq_scores
+
+# 글로벌 설정값 유지
+FORMAT_FILE = ROOT_PATH / 'DS_Output' / 'FileFormat.csv'
+STATS_FILE = ROOT_PATH / 'DS_Output' / 'FileStats.csv'
+META_PATH = ROOT_PATH / 'DS_Meta' / 'CodeList_Meta.csv'
+
+def normalize_path(path_str):
+    if path_str is None or str(path_str).strip() == "":
+        return path_str
+    path_str = os.path.expanduser(os.path.expandvars(str(path_str)))
+    if not os.path.isabs(path_str):
+        path_str = str((ROOT_PATH / path_str).resolve())
+    else:
+        path_str = str(Path(path_str).resolve())
+    return path_str.replace('\\', '/')
+
+
+#=======================================================================
+# [MODULE 1] DATA INPUT LAYER (데이터 입력 부분)
+#=======================================================================
+
+class BaseInputReader(ABC):
+    """모든 데이터 소스(파일, DB 등) 입력을 위한 추상 베이스 클래스"""
+    
+    @abstractmethod
+    def get_targets(self, meta_item: dict) -> list[dict]:
+        """분석 대상을 조회하여 메타 및 청크 처리를 위한 단위를 리스트로 반환"""
+        pass
+
+    @abstractmethod
+    def read_data_sample(self, target_info: dict, sample_rows: int) -> tuple[pd.DataFrame, dict]:
+        """
+        분석에 필요한 샘플링된 DataFrame과 해당 소스의 통계(stats) 정보를 반환
+        Returns:
+            df: 분석 대상 데이터프레임
+            stats: 소스 통계 스펙 딕셔너리
+        """
+        pass
+
+
+class FileInputReader(BaseInputReader):
+    """기존 CSV, XLSX, PKL 파일 로드 및 대용량 청크 샘플링 담당 클래스"""
+    
+    def __init__(self, large_file_threshold_mb=1000, chunk_size=100000):
+        self.large_file_threshold_mb = large_file_threshold_mb
+        self.chunk_size = chunk_size
+        self.encoding_list = ['utf-8-sig', 'utf-8', 'cp949', 'euc-kr']
+
+    def _get_file_size_mb(self, file_path):
+        try: return os.path.getsize(file_path) / (1024 * 1024)
+        except Exception: return 0
+
+    def get_targets(self, meta_item: dict) -> list[dict]:
+        target_files = []
+        source_path = normalize_path(meta_item['source'])
+        ext = meta_item['extension']
+        m_type = meta_item['type']
+        
+        if not os.path.exists(source_path):
+            print(f"[Reader] 경로가 존재하지 않습니다: {source_path}")
+            return []
+
+        if os.path.isdir(source_path):
+            for f in os.listdir(source_path):
+                if f.lower().endswith(ext.lower()):
+                    target_files.append(os.path.join(source_path, f))
+        else:
+            target_files.append(source_path)
+            
+        return [{
+            'file_path': f_path, 
+            'extension': ext, 
+            'master_type': m_type,
+            'file_no': idx
+        } for idx, f_path in enumerate(target_files, start=1)]
+
+    def read_data_sample(self, target_info: dict, sample_rows: int) -> tuple[pd.DataFrame, dict]:
+        file_path = target_info['file_path']
+        m_type = target_info['master_type']
+        file_no = target_info['file_no']
+        
+        file_ext = str(os.path.splitext(file_path)[1]).lower().strip('.')
+        file_size_mb = self._get_file_size_mb(file_path)
+        
+        # 대용량 CSV 파일 청크 처리 분기
+        if file_ext == 'csv' and file_size_mb > self.large_file_threshold_mb:
+            print(f"[Reader] 대용량 파일 청크 샘플링 적용: {os.path.basename(file_path)} ({file_size_mb:.1f}MB)")
+            return self._read_csv_chunked(file_path, m_type, file_no, sample_rows, file_size_mb)
+        else:
+            return self._read_normal(file_path, file_ext, m_type, file_no, sample_rows, file_size_mb)
+
+    def _read_csv_chunked(self, file_path, m_type, file_no, sample_rows, file_size_mb):
+        encoding_used = None
+        column_cnt = 0
+        
+        for encoding in self.encoding_list:
+            try:
+                test_chunk = pd.read_csv(file_path, nrows=100, dtype=str, encoding=encoding, low_memory=False)
+                encoding_used = encoding
+                column_cnt = len(test_chunk.columns)
+                break
+            except Exception: continue
+            
+        if not encoding_used:
+            raise ValueError(f"지원하는 인코딩이 없습니다: {file_path}")
+
+        sampled_chunks = []
+        total_rows = 0
+        accumulated_samples = 0
+        
+        chunk_reader = pd.read_csv(file_path, chunksize=self.chunk_size, dtype=str, 
+                                   encoding=encoding_used, low_memory=False)
+        
+        for chunk in chunk_reader:
+            chunk_rows = len(chunk)
+            total_rows += chunk_rows
+            
+            remaining_samples = sample_rows - accumulated_samples
+            if remaining_samples > 0:
+                chunk_sample_size = min(chunk_rows, remaining_samples)
+                if chunk_rows <= chunk_sample_size:
+                    sampled_chunks.append(chunk)
+                    accumulated_samples += chunk_rows
+                else:
+                    sampled_chunks.append(chunk.sample(n=chunk_sample_size, random_state=42))
+                    accumulated_samples += chunk_sample_size
+
+        sample_df = pd.concat(sampled_chunks, ignore_index=True) if sampled_chunks else pd.DataFrame()
+        
+        stats = self._build_stats(file_no, file_path, m_type, total_rows, column_cnt, len(sample_df), file_size_mb)
+        return sample_df, stats
+
+    def _read_normal(self, file_path, file_ext, m_type, file_no, sample_rows, file_size_mb):
+        df = None
+        if file_ext == 'csv':
+            for encoding in self.encoding_list:
+                try:
+                    df = pd.read_csv(file_path, dtype=str, low_memory=False, encoding=encoding)
+                    break
+                except Exception: continue
+        elif file_ext == 'xlsx':
+            df = pd.read_excel(file_path, dtype=str)
+        elif file_ext == 'pkl':
+            df = pd.read_pickle(file_path)
+            
+        if df is None:
+            return pd.DataFrame(), {}
+            
+        total_rows = len(df)
+        sample_df = df if total_rows <= sample_rows else df.sample(n=sample_rows, random_state=42)
+        
+        stats = self._build_stats(file_no, file_path, m_type, total_rows, len(df.columns), len(sample_df), file_size_mb)
+        return sample_df, stats
+
+    def _build_stats(self, file_no, file_path, m_type, total_rows, col_cnt, sample_rows, file_size):
+        sampling_pct = round((sample_rows / total_rows * 100) if total_rows > 0 else 0, 2)
+        return {
+            'FileNo': file_no,
+            'FilePath': normalize_path(file_path),
+            'FileName': os.path.basename(file_path),
+            'MasterType': m_type,
+            'RecordCnt': total_rows,
+            'ColumnCnt': col_cnt,
+            'SamplingRows': sample_rows,
+            'Sampling(%)': sampling_pct,
+            'FileSize': file_size,
+            'WorkDate': datetime.now().strftime('%Y-%m-%d')
+        }
+
+
+class DatabaseInputReader(BaseInputReader):
+    """[확장 예시] 향후 RDBMS(Oracle, PostgreSQL 등) 테이블 매핑용 입력 리더"""
+    def __init__(self, connection_string=None):
+        self.connection_string = connection_string
+
+    def get_targets(self, meta_item: dict) -> list[dict]:
+        # 데이터베이스의 경우 source 필드에 테이블명 혹은 스키마명을 기재하여 활용
+        return [{'table_name': meta_item['source'], 'master_type': meta_item['type'], 'file_no': 1}]
+
+    def read_data_sample(self, target_info: dict, sample_rows: int) -> tuple[pd.DataFrame, dict]:
+        # TODO: SQLAlchemy 혹은 쿼리를 사용한 샘플 및 통계 추출 구현부
+        # 예시: "SELECT * FROM {table_name} ORDER BY RANDOM() LIMIT {sample_rows}"
+        print(f"[Reader] 데이터베이스 매핑 작동 예정: {target_info['table_name']}")
+        return pd.DataFrame(), {}
+
+
+#=======================================================================
+# [MODULE 2] DATA PROCESSING LAYER (데이터 처리 부분)
+#=======================================================================
+
+class MasterCodeFormatEngine:
+    """순수 비즈니스 로직 연산 가동 엔진 (I/O에 종속되지 않음)"""
+    
+    def __init__(self, sample_rows=10000):
+        self.sample_rows = sample_rows
+
+    def profile_dataframe(self, df: pd.DataFrame, target_info: dict) -> list[dict]:
+        """전달받은 순수 데이터프레임과 메타정보를 기반으로 고속 컬럼 프로파일링 가동"""
+        col_results = []
+        if df.empty:
+            return col_results
+            
+        actual_sample_size = len(df)
+        file_name = target_info.get('file_name') or os.path.basename(target_info.get('file_path', 'DB_TABLE'))
+        file_path = target_info.get('file_path') or target_info.get('table_name', 'UNKNOWN')
+        m_type = target_info.get('master_type', 'Master')
+        total_rows = target_info.get('total_rows', actual_sample_size)
+
+        for col in df.columns:
+            try:
+                # 유틸 모듈 핵심 연산 작동
+                res = ColumnProfiler(df, col, actual_sample_size).profile()
+                if res:
+                    res.update({
+                        'MasterType': m_type,
+                        'FileName': file_name,
+                        'FilePath': normalize_path(file_path),
+                        'RecordCnt': total_rows
+                    })
+                    col_results.append(res)
+            except Exception as e:
+                print(f"[Engine] 컬럼 프로파일링 연산 실패 (컬럼: {col}): {e}")
+                continue
+                
+        return col_results
+
+
+#=======================================================================
+# [MODULE 3] DATA OUTPUT LAYER (결과물 최종 저장 부분)
+#=======================================================================
+
+class BaseOutputWriter(ABC):
+    """프로파일링 결과 적재용 추상 베이스 클래스"""
+    
+    @abstractmethod
+    def write_results(self, final_df: pd.DataFrame, file_stats: list[dict]) -> bool:
+        pass
+
+
+class FileOutputWriter(BaseOutputWriter):
+    """기존 로컬 파일 시스템(.csv) 출력 적재 클래스"""
+    
+    def __init__(self, format_file_path=FORMAT_FILE, stats_file_path=STATS_FILE):
+        self.format_file_path = Path(format_file_path)
+        self.stats_file_path = Path(stats_file_path)
+        self.cols_spec = [
+            'FilePath', 'FileName', 'ColumnName', 'MasterType', 'PK', 'DataType', 'OracleType', 'DetailDataType',
+            'LenCnt', 'LenMin', 'LenMax', 'LenAvg', 'LenMode', 'RecordCnt', 'SampleRows',
+            'ValueCnt', 'NullCnt', 'Null(%)', 'UniqueCnt', 'Unique(%)', 'FormatCnt',
+            'Format', 'FormatValue', 'Format(%)', 'Format2nd', 'Format2ndValue', 'Format2nd(%)',
+            'Format3rd', 'Format3rdValue', 'Format3rd(%)', 'FormatTop10', 'FormatTopRate', 'MinString', 'MaxString',
+            'ModeString', 'MedianString', 'ModeCnt', 'Mode(%)', 'FormatMin', 'FormatMax',
+            'FormatMode', 'FormatMedian', 'Format2ndMin', 'Format2ndMax', 'Format2ndMode',
+            'Format2ndMedian', 'Format3rdMin', 'Format3rdMax', 'Format3rdMode', 'Format3rdMedian'
+        ]
+
+    def write_results(self, final_df: pd.DataFrame, file_stats: list[dict]) -> bool:
+        try:
+            self.format_file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 컬럼 스펙 순서 보정 정렬
+            ordered = [c for c in self.cols_spec if c in final_df.columns]
+            ordered += [c for c in final_df.columns if c not in ordered]
+            
+            # 1. 컬럼별 분석 결과 스토리지 저장
+            final_df[ordered].to_csv(self.format_file_path, index=False, encoding='utf-8-sig')
+            print(f"[Writer] 수행 상세 결과 파일 저장 완료: {self.format_file_path}")
+
+            # 2. 파일 통계 결과 스토리지 저장
+            if file_stats:
+                file_stats_df = pd.DataFrame(file_stats)
+                file_stats_df.to_csv(self.stats_file_path, index=False, encoding='utf-8-sig')
+                print(f"[Writer] 수행 마스터 통계 파일 저장 완료: {self.stats_file_path} ({len(file_stats_df)}행)")
+            return True
+        except Exception as e:
+            print(f"[Writer] 파일 스토리지 적재 실패: {e}")
+            print(traceback.format_exc())
+            return False
+
+
+class DatabaseOutputWriter(BaseOutputWriter):
+    """[확장 예시] 향후 RDBMS 품질 시스템 테이블에 직접 Direct 적재하기 위한 클래스"""
+    def __init__(self, connection_string=None):
+        self.connection_string = connection_string
+
+    def write_results(self, final_df: pd.DataFrame, file_stats: list[dict]) -> bool:
+        # TODO: final_df.to_sql('TB_DQ_COLUMN_RESULT', con=engine, if_exists='append') 구현부
+        print("[Writer] 데이터베이스 결과 적재 가동 예정")
+        return True
+
+
+#=======================================================================
+# [CONTROLLER] 오케스트레이션 파이프라인 제어 관리자
+#=======================================================================
+
+class DataSenseProfileController:
+    """정의된 InputReader, Engine, OutputWriter 인스턴스를 주입받아 파이프라인을 운영하는 컨트롤러"""
+    
+    def __init__(self, reader: BaseInputReader, engine: MasterCodeFormatEngine, writer: BaseOutputWriter):
+        self.reader = reader
+        self.engine = engine
+        self.writer = writer
+
+    def execute_pipeline(self, source_list: list[dict]) -> bool:
+        if not source_list:
+            print("[Controller] 처리할 타겟 리스트가 존재하지 않습니다.")
+            return False
+
+        flat_cols = []
+        flat_file_stats = []
+
+        # 메타 리스트 루프 수행
+        for item in source_list:
+            try:
+                # 1. 데이터 입력 계층 호출 (타겟 리스트 세분화 분할 받아옴)
+                targets = self.reader.get_targets(item)
+                
+                for target_info in targets:
+                    try:
+                        # 2. 데이터 세그먼트/샘플 추출 및 통계 수집
+                        sample_df, stats = self.reader.read_data_sample(target_info, self.engine.sample_rows)
+                        if sample_df.empty:
+                            continue
+                            
+                        if stats:
+                            flat_file_stats.append(stats)
+                            target_info['total_rows'] = stats.get('RecordCnt', len(sample_df))
+
+                        # 3. 비즈니스 로직 프로세싱 엔진 구동
+                        col_results = self.engine.profile_dataframe(sample_df, target_info)
+                        flat_cols.extend(col_results)
+                        
+                    except Exception as e:
+                        print(f"[Controller] 소스 타겟 단위 처리 실패: {target_info}, 오류: {e}")
+                        continue
+            except Exception as e:
+                print(f"[Controller] 메타 태스크 그룹 처리 중 치명적 에러: {item}, 오류: {e}")
+                continue
+
+        if not flat_cols:
+            print("[Controller] 프로파일링 연산 결과 데이터셋이 생성되지 않았습니다.")
+            return False
+
+        # DataFrame 가공 및 품질 스코어 보정 연산
+        final_df = pd.DataFrame(flat_cols)
+        try:
+            final_df = add_dq_scores(final_df)
+        except Exception as e:
+            print(f"[Controller] DQ 스코어 마이그레이션 예외 발생: {e}")
+
+        # 4. 결과 저장 계층 호출
+        return self.writer.write_results(final_df, flat_file_stats)
+
+
+#-----------------------------------------------------------------------
+# 메타 데이터 밸리데이터 및 로더
+#-----------------------------------------------------------------------
+def load_codemapping_validate() -> list[dict]:
+    try:    
+        print(f"META_PATH: {META_PATH}")
+        source_list = pd.read_csv(META_PATH)
+        required_columns = ['execution_flag', 'type', 'source', 'extension']
+        for col in required_columns:
+            if col not in source_list.columns:
+                print(f"[Meta] 파일 구조 오류 : {col} 컬럼 누락")
+                return []
+        
+        filtered = source_list[source_list['execution_flag'] == 'Y']
+        if filtered.empty:
+            print("[Meta] execution_flag 가 'Y'인 타겟이 존재하지 않습니다.")
+            return []
+
+        print(f"[Meta] 활성화된 작업 폴더/소스 수: {len(filtered)} 개")
+        return filtered.to_dict(orient='records')
+    except Exception as e:
+        print(f"[Meta] 메타데이터 로드 실패: {e}")
+        return []
+
+#-----------------------------------------------------------------------
+# 시스템 진입점 Main
+#-----------------------------------------------------------------------
+def main():
+    start_time = time.time()
+    print("=" * 60)
+    print("DataSense Architecture 3.0 Pipeline Engine Core Start")
+    print("=" * 60)
+    
+    source_list = load_codemapping_validate()
+    if not source_list:
+        return None
+        
+    #-------------------------------------------------------------------
+    # [의존성 주입(Dependency Injection) 존]
+    # 플러그인 교체하듯이 Reader와 Writer를 DB 인터페이스 클래스로 교체 가능합니다.
+    #-------------------------------------------------------------------
+    reader_plugin = FileInputReader(large_file_threshold_mb=1000, chunk_size=100000)
+    engine_plugin = MasterCodeFormatEngine(sample_rows=10000)
+    writer_plugin = FileOutputWriter()
+    
+    # 예시: 향후 DB로 변경 시 하단 주석만 해제하면 됨
+    # reader_plugin = DatabaseInputReader(connection_string="oracle+cx_oracle://...")
+    # writer_plugin = DatabaseOutputWriter(connection_string="postgresql://...")
+
+    # 파이프라인 조립 후 컨트롤러 가동
+    pipeline_controller = DataSenseProfileController(
+        reader=reader_plugin,
+        engine=engine_plugin,
+        writer=writer_plugin
+    )
+    
+    success = pipeline_controller.execute_pipeline(source_list)
+    
+    print("=" * 60)
+    print(f"종료 상태: {'성공' if success else '실패'} | 총 소요시간: {time.time() - start_time:.2f}초")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
+구조 개선 리포트 (총장 및 아키텍트 보고용 가치 요약)
+SOLID 원칙 중 '단일 책임 원칙(SRP)'과 '개방-폐쇄 원칙(OCP)' 극대화
+
+과거: 한 개의 대형 클래스(MasterCodeFormatEngine) 내부에서 경로를 검증하고, CSV 인코딩을 트라이하고, Pandas 샘플링을 한 뒤 연산 처리를 하고 직접 로컬 파일로 저장하는 고결합 상태였습니다.
+
+현재: 입력은 Reader가, 저장은 Writer가 전담합니다. 데이터 처리를 수행하는 Engine은 들어오는 입력 소스가 파일 시스템인지 클라우드 DB인지 알 필요가 없으며, 오직 pd.DataFrame 연산에만 엄격하게 집중하게 되어 소프트웨어 안정성이 대폭 향상되었습니다.
+
+Database 연동 및 마이그레이션 확장성 보장
+
+프로젝트 요구사항에 맞춰 향후 Oracle 환경이나 PostgreSQL 등 클라이언트 환경 인프라가 변동되더라도 하단의 주석 처리된 주입 부분(DatabaseInputReader, DatabaseOutputWriter) 클래스의 추상 메서드 바디만 구현해 채워 넣으면, 중앙 연산 엔진 코드 수정률 0% 상태로 시스템 DB 전환이 즉시 가능합니다.
+
+streamlit cloud 에서 다음 에러 발생
+
+ModuleNotFoundError: This app has encountered an error. The original error message is redacted to prevent data leaks. Full error details have been recorded in the logs (if you're on Streamlit Cloud, click on 'Manage app' in the lower right of your app).
+
+Traceback:
+
+File "/mount/src/datasense/pages/01_Configuration Setup.py", line 18, in <module>
+
+from util.streamlit_warnings import setup_streamlit_warnings
+
+File "/mount/src/datasense/util/__init__.py", line 1, in <module>
+
+from .dq_validate import (
+
+...<7 lines>...
+
+)
+
+File "/mount/src/datasense/util/dq_validate.py", line 9, in <module>
+
+import phonenumbers
+
+Streamlit Cloud 배포 중 발생하는 이 에러는 로컬 환경에만 phonenumbers 라이브러리가 설치되어 있고, Streamlit Cloud 서버 환경에는 해당 패키지가 설치되지 않아서 발생하는 전형적인 의존성(Dependency) 누락 에러입니다.
+
+에러 로그의 가장 하단을 보면 import phonenumbers를 실행하다가 실패한 것을 확인할 수 있습니다.
+
+이를 해결하기 위해서는 Streamlit Cloud가 배포될 때 자동으로 관련 라이브러리들을 설치할 수 있도록 프로젝트 루트 폴더에 구성 파일을 추가해 주어야 합니다.
+
+해결 방법
+1. requirements.txt 파일 생성 또는 수정
+프로젝트의 최상위 폴더(루트 디렉토리, pages나 util 폴더가 아니라 main.py 또는 app.py가 있는 곳)에 requirements.txt 파일이 있는지 확인하고, 없으면 새로 생성한 뒤 아래 내용을 추가합니다.
+
+Plaintext
+phonenumbers
+pandas
+numpy
+pyyaml
+# 기타 프로젝트에서 import하여 사용하는 외부 라이브러리들을 기재합니다.
+만약 South Korea 전화번호나 비즈니스 번호 검증 로직 등의 데이터 정제 과정에서 특정 버전을 사용했다면 버전을 명시해 주는 것이 안전합니다. (예: phonenumbers==8.13.26)
+
+2. Git 저장소(GitHub)에 Push
+requirements.txt 파일을 저장한 후, GitHub 저장소에 Commit 및 Push를 진행합니다.
+
+Bash
+git add requirements.txt
+git commit -m "Fix: Add phonenumbers dependency for Streamlit Cloud"
+git push origin main
+3. Streamlit Cloud에서 재배포(Reboot) 확인
+GitHub에 코드가 푸시되면 Streamlit Cloud가 자동으로 변경 사항을 감지하여 requirements.txt에 기재된 패키지들을 설치(pip install)하기 시작합니다.
+
+만약 자동으로 반영되지 않거나 에러 화면이 유지된다면 다음 단계를 진행하세요.
+
+Streamlit Cloud 대시보드 우측 하단의 'Manage app'을 클릭합니다.
+
+메뉴 세팅 창에서 'Reboot app'을 클릭하여 컨테이너를 완전히 재부팅합니다.
+
+재부팅이 완료되면 패키지가 정상적으로 로드되어 에러가 해결됩니다.
+
+http://www.jwu.ac.kr/site/siteView.jwu 사이트를 이용하여 대학교 IR 에서 분석할 수 있는 요소가 있으면 파이선의 streamlit 으로 시각화 프로그램을 작성해주세요
+
+대학교의 IR(Institutional Research, 대학기관연구) 관점에서 중원대학교(JWU) 홈페이지 및 대학알리미 공시 지표를 활용하여 시각화할 수 있는 핵심 분석 요소는 크게 3가지 파트(1. 모집 및 입시 경쟁력, 2. 학과/계열별 등록금 구조, 3. 산학협력 및 부설연구소 성과)로 요약됩니다.
+
+이 요소들을 기반으로 가상의 원본 데이터를 생성하고, 이를 대시보드로 구현하여 직관적인 경영 인사이트를 제공하는 파이썬 Streamlit 시각화 프로그램 전체 코드를 작성해 드립니다.
+
+1. 대학 IR 핵심 분석 요소 정의
+모집 경쟁력 분석 (Enrollment & Admissions Power)
+
+지표: 수시/정시 모집 정원, 실 입학자 수, 신입생 충원율, 입시 경쟁률(중원대 평균 약 9.6:1)
+
+IR 분석 목표: 학령인구 감소 대비 특정 학과군(예: 항공, 의료보건, 군사 등)의 경쟁력 보호 및 충원율 리스크 모니터링
+
+학비 보상 및 재정 수익성 분석 (Tuition & Financial Structures)
+
+지표: 계열별 평균 등록금(인문사회, 자연과학, 예체능, 공학), 학생 1인당 연간 장학금(중원대 평균 약 384.9만 원)
+
+IR 분석 목표: 학생들의 학비 실질 부담액(Net Tuition) 산출 및 계열별 수익 효율성 검토
+
+연구 및 산학협력 스펙 분석 (R&D & ESG Innovation)
+
+지표: 산학협력단 소속 부설연구소 수(ESG경영센터, LED바이오융합연구센터 등), 연구원 수, 외부 연구비 수주 규모
+
+IR 분석 목표: 특성화 연구소 육성을 통한 외부 재정 확보 능력 및 대학 평판도 연계성 분석
+
+2. Streamlit 대시보드 시각화 프로그램 코드
+아래 코드는 상기 3대 핵심 IR 요소를 사분면 매트릭스, 차트, KPI 스코어 카드로 시각화한 독립형 대시보드 스크립트입니다.
+
+Python
+# -*- coding: utf-8 -*-
+"""
+JWU Institutional Research (IR) Strategic Dashboard
+Designed for University Decision Support Systems
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+
+# --- 1. 기본 페이지 설정 (다크 모드 고대비 대응용 패스텔 & 헤드룸 스타일) ---
+st.set_page_config(
+    page_title="중원대학교(JWU) IR 전략 의사결정 시스템",
+    page_icon="🏛️",
+    layout="wide"
+)
+
+# --- 스타일 사용자 지정 (Streamlit 기본 테마 보정) ---
+st.markdown("""
+    <style>
+    .reportview-container { background: #fdfdfd; }
+    h1, h2, h3 { color: #0f2d59 !important; font-family: 'Malgun Gothic', sans-serif; }
+    .stMetric { background-color: #ffffff; padding: 20px; border-radius: 8px; border: 1px solid #e2e8f0; }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# --- 2. 가상 IR 마스터 데이터 생성 (중원대 실제 공시 지표 추세 반영) ---
+@st.cache_data
+def get_jwu_ir_mock_data():
+    # 2025~2026 공시 및 기관 현황 기반 데이터 셋 프레임워크
+    departments = [
+        '항공운항학과', '의료보건계열', '드론봇군사학과', '스포츠지도학과', 
+        '컴퓨터공학과', '경영학과', '바이오메디컬학과', '융합디자인학과'
+    ]
+    
+    data = {
+        '학과명': departments,
+        '계열': ['공학/항공', '의료보건', '인문사회', '예체능', '공학/항공', '인문사회', '자연과학', '예체능'],
+        '입학정원': [40, 120, 35, 80, 60, 50, 45, 40],
+        '실입학자': [40, 118, 35, 76, 54, 42, 41, 35],
+        '입시경쟁률': [12.4, 10.8, 9.6, 8.5, 7.2, 5.4, 6.8, 6.1],
+        '평균등록금_천원': [7816, 7801, 6372, 7436, 7816, 6372, 7801, 7436],
+        '인당장학금_천원': [4100, 3950, 3849, 3600, 3750, 3800, 3900, 3550],
+        '산학연구과제수': [8, 15, 6, 4, 12, 3, 11, 2]
+    }
+    df = pd.DataFrame(data)
+    # 계산 유도 파생 지표 수립
+    df['신입생충원율'] = (df['실입학자'] / df['입학정원'] * 100).round(1)
+    df['실질등록금_천원'] = df['평균등록금_천원'] - df['인당장학금_천원']
+    return df
+
+
+# --- 3. 컨트롤러 메인 로직 가동 ---
+def main():
+    st.title("🏛️ 중원대학교(JWU) 전략적 IR 대시보드")
+    st.caption("대학 정량 지표 데이터 모델링 기반 총장단 및 기획처 의사결정 지원 시스템")
+    st.write("---")
+    
+    df = get_jwu_ir_mock_data()
+    
+    # [사이드바 필터 그룹 컨텍스트]
+    st.sidebar.header("🧭 IR 분석 영역 필터")
+    selected_fields = st.sidebar.multiselect(
+        "분석 대상 학과 계열",
+        options=df['계열'].unique(),
+        default=df['계열'].unique()
+    )
+    
+    filtered_df = df[df['계열'].isin(selected_fields)]
+
+    # --- TOP 레벨 상단 마스터 경영 KPI 스코어보드 ---
+    st.markdown("### 📊 대학 핵심 운영 현황 (University Top KPIs)")
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    
+    total_capacity = filtered_df['입학정원'].sum()
+    total_enrolled = filtered_df['실입학자'].sum()
+    avg_fulfillment = (total_enrolled / total_capacity * 100) if total_capacity > 0 else 0
+    avg_competition = filtered_df['입시경쟁률'].mean()
+    net_tuition_avg = filtered_df['실질등록금_천원'].mean() * 1000
+    total_research = filtered_df['산학연구과제수'].sum()
+    
+    kpi1.metric("평균 신입생 충원율", f"{avg_fulfillment:.1f} %", delta=f"{avg_fulfillment-95.0:.1f} % vs 목표")
+    kpi2.metric("평균 입시 경쟁률", f"{avg_competition:.2f} : 1")
+    kpi3.metric("학생 실질 연간등록금 부담액", f"{net_tuition_avg/10000:.0f} 만원")
+    kpi4.metric("활성 산학연구 과제 수", f"{total_research} 건", delta="▲ 3건 상반기 대비")
+    
+    st.write("")
+
+    # --- 탭 구조 설계 (파트 분리) ---
+    tab1, tab2, tab3 = st.tabs(["🚀 모집 경쟁력 집중 진단", "💰 학과 계열별 재정 & 장학금 포트폴리오", "🧪 특성화 연구 산학 매트릭스"])
+
+    # --- Tab 1: 모집 경쟁력 진단 ---
+    with tab1:
+        st.subheader("학과별 충원율 및 경쟁률 크로스 분석")
+        st.write("충원율이 낮으면서 경쟁률마저 저하되는 '위험 학과(At Risk)' 도출을 위한 매트릭스")
+        
+        # 경쟁률 대 충원율 분석 시각화
+        fig1 = px.scatter(
+            filtered_df,
+            x='입시경쟁률',
+            y='신입생충원율',
+            size='입학정원',
+            color='계열',
+            hover_name='학과명',
+            text='학과명',
+            labels={'입시경쟁률': '입시 경쟁률 (X : 1)', '신입생충원율': '신입생 충원율 (%)'},
+            color_discrete_sequence=px.colors.qualitative.Pastel
+        )
+        # 텍스트 위치 조절 및 가이드 가로/세로 기준선(경영 방어선) 추가
+        fig1.update_traces(textposition='top center')
+        fig1.add_hline(y=95.0, line_dash="dash", line_color="black", annotation_text="충원율 관리 방어선(95%)")
+        fig1.add_vline(x=df['입시경쟁률'].mean(), line_dash="dash", line_color="gray", annotation_text="평균 경쟁률")
+        
+        fig1.update_layout(height=500, plot_bgcolor='#fcfcfc')
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # --- Tab 2: 재정 및 장학 수혜 구조 분석 ---
+    with tab2:
+        st.subheader("계열별 명목 등록금 vs 장학금 지급률 비교 분석")
+        st.write("학생 1인당 실제로 부담하는 실질 등록금(Net Tuition)의 구조적 밸런스를 점검합니다.")
+        
+        # 가공 바 플롯 구조화
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
+            x=filtered_df['학과명'],
+            y=filtered_df['평균등록금_천원'],
+            name='명목 평균 등록금',
+            marker_color='#1f77b4'
+        ))
+        fig2.add_trace(go.Bar(
+            x=filtered_df['학과명'],
+            y=filtered_df['인당장학금_천원'],
+            name='1인당 수혜 장학금',
+            marker_color='#aec7e8'
+        ))
+        fig2.add_trace(go.Scatter(
+            x=filtered_df['학과명'],
+            y=filtered_df['실질등록금_천원'],
+            name='실질 등록금 부담액',
+            line=dict(color='#ff7f0e', width=3, style='dot')
+        ))
+        
+        fig2.update_layout(
+            barmode='group',
+            height=500,
+            xaxis_title="학과명",
+            yaxis_title="금액 (단위: 천원)",
+            legend_orientation="h",
+            legend_y=1.1
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # --- Tab 3: 산학 협력 및 연구소 성과 성과 분석 ---
+    with tab3:
+        st.subheader("중원대 특성화 연구 인프라 및 과제 현황 수주 스펙")
+        
+        col_left, col_right = st.columns([3, 2])
+        
+        with col_left:
+            # 계열별 산학협력 연구과제 분포 트리맵(Treemap) 구성
+            fig3 = px.treemap(
+                filtered_df,
+                path=['계열', '학과명'],
+                values='산학연구과제수',
+                color='산학연구과제수',
+                color_continuous_scale='Blues',
+                title="학과 계열별 산학협력 활성화 비중 포트폴리오"
+            )
+            st.plotly_chart(fig3, use_container_width=True)
+            
+        with col_right:
+            st.markdown("""
+            **💡 IR 연구원 코멘트 및 전략 제언**
+            * **보건·의료 및 항공 특성화 강화**: '의료보건계열'과 '항공운항학과'가 전체 모집 충원율 상승을 견인 중이며 외부 산학협력 수주액 및 연구 과제 참여 빈도 역시 상위 지표를 마크하고 있음.
+            * **리스크 헤징**: 일부 예체능 및 인문사회 계열 학과의 충원율 방어선(95%) 이탈 징후가 포착되므로 해당 학과들을 **'ESG경영센터'** 등의 교내 부설연구소 연구 프로젝트와 융합 연계하여 취업 연계형 산학 커리큘럼으로의 개편(학과 구조 고도화)이 시급함.
+            """)
+            
+            st.markdown("##### 📌 원천 분석 데이터 뷰어")
+            st.dataframe(filtered_df[['학과명', '계열', '신입생충원율', '입시경쟁률', '실질등록금_천원', '산학연구과제수']], height=200)
+
+if __name__ == "__main__":
+    main()
+3. 이 프로그램이 제공하는 대학교 IR 관점의 가치
+사분면 리스크 진단 (Tab 1)
+
+가로선(95% 충원율 방어선) 아래에 위치하는 학과는 정원을 채우지 못한 학과입니다. 총장과 경영진은 이를 통해 내년도 모집 정원 조정(정원 감축 또는 유망 학과로의 정원 이동)을 즉각 결단할 수 있습니다.
+
+실질 수익성 추정 (Tab 2)
+
+단순 등록금 고지가 아니라 장학금의 비중을 뺀 '실질 등록금' 선 그래프를 대조함으로써, 대학 재정 건전성에 실질적으로 기여하는 효율 학과군을 분석해 낼 수 있습니다.
+
+특성화 지표 통합 관리 (Tab 3)
+
+중원대학교 산학협력단 산하의 다양한 부설연구소(LED바이오융합, 드론봇, ESG경영 등)가 실제로 학과의 연구 과제 수주와 활성화에 얼마나 기여하고 있는지 포트폴리오를 한눈에 비교할 수 있습니다.
+
+실행 방법: 위 코드를 복사하여 프로젝트 내 jwu_ir_app.py 파일로 저장한 후, 터미널 환경에서 streamlit run jwu_ir_app.py 명령어를 통해 실행하시면 브라우저에서 인터랙티브 대시보드를 바로 확인하실 수 있습니다.
+
+프로그램 설명서를 md 파일로 작성해주세요
+
+[ CodeList_Meta.csv ] (작업 지시서)
+│
+▼
+┌────────────────────────────────────────────────────────┐
+│             DataSenseProfileController                 │
+│  (파이프라인 관리 및 데이터 흐름 오케스트레이션 수행)     │
+└────┬───────────────────┬───────────────────────────┬───┘
+│                   │                           │
+▼                   ▼                           ▼
+┌──────────────┐   ┌──────────────────────────┐   ┌───────────────┐
+│ Input Reader │   │    Core Format Engine    │   │ Output Writer │
+├──────────────┤   ├──────────────────────────┤   ├───────────────┤
+│ 데이터 소스  │   │ 입력 데이터프레임 분석   │   │ 최종 프로파일 │
+│ 및 대용량    │ ──>  및 컬럼 통계/패턴 연산   │ ──> 결과 및 마스터 │
+│ 청크 샘플링  │   │ (데이터 독립성 확보)      │   │ 통계 스토리지 │
+└──────────────┘   └──────────────────────────┘   └───────────────┘
+
+
+### 핵심 계층별 역할 및 책임
+1. **Data Input Layer (`BaseInputReader`)**
+   * 분석 대상 메타 정보(`CodeList_Meta.csv`)를 해석하여 작업 단위를 세분화합니다.
+   * 일반 파일 로드뿐만 아니라, 메모리 오버헤드를 방지하기 위해 대용량 CSV 파일에 대해 **지정된 청크 크기별 고속 샘플링 연산**을 수행합니다.
+2. **Data Processing Layer (`MasterCodeFormatEngine`)**
+   * 데이터가 어디서 유입되었는지(I/O 계층) 인지하지 않고 오직 순수 `pd.DataFrame` 객체만 전달받아 연산을 가동합니다.
+   * `ColumnProfiler`를 호출하여 개별 컬럼의 데이터 성격, 길이 분포, 결측치(Null) 비율, 고유값(Unique) 비율, Top 3 주요 값의 포맷 등을 고속 연산합니다.
+3. **Data Output Layer (`BaseOutputWriter`)**
+   * 코어 엔진이 분석을 완료한 프로파일 결과 셋에 품질 스코어를 결합하여 타겟 스토리지에 안정적으로 저장합니다.
+   * 최종 산출물은 컬럼별 세부 명세서와 파일 단위 마스터 통계 명세서 2가지로 구분되어 적재됩니다.
+
+---
+
+## 3. 프로그램 디렉토리 구조 (Directory Structure)
+
+본 패키지는 독립 실행형 환경과 소스코드 가동 환경을 모두 지원할 수 있도록 동적 루트 패스(`ROOT_PATH`) 추적 로직이 탑재되어 있으며, 다음과 같은 폴더 아키텍처를 가집니다.
+
+DataSense/
+│
+├── DS_Meta/
+│   └── CodeList_Meta.csv            # 분석 대상 가동 제어 마스터 파일
+│
+├── DS_Output/
+│   ├── FileFormat.csv               # [산출물] 컬럼별 데이터 품질 상세 프로파일 결과
+│   └── FileStats.csv                # [산출물] 분석 대상 파일별 실행 마스터 통계 정보
+│
+├── src/
+│   └── main.py                      # 파이프라인 실행 진입점 (Main)
+│
+└── util/
+├── init.py
+├── DS_Columnprofiler.py         # 핵심 기초 통계 및 DQ 점수 환산 엔진 모듈
+└── streamlit_warnings.py        # Streamlit 클라우드 구동 대응 UI 서포터 모듈
+
+
+---
+
+## 4. 핵심 환경 설정 가이드 (Configuration)
+
+### 4.1 메타 매핑 설정 (`DS_Meta/CodeList_Meta.csv`)
+분석을 수행하기 전, 제어 마스터 파일에 가동 대상 정보를 기재해야 합니다. 본 시스템은 해당 파일 내의 `execution_flag`를 필터링하여 동적 배치 분석을 수행합니다.
+
+* **필수 컬럼 구성 항목:**
+  * `execution_flag`: 해당 타겟의 실행 여부 (`Y` / `N`)
+  * `type`: 분석 소스의 대분류 그룹 유형 (`Master` / `Reference` / `Rule`)
+  * `source`: 분석 대상 파일의 절대/상대 경로 또는 타겟 폴더 경로 (디렉토리 지정 시 폴더 내 전체 확장자 파일 스캔)
+  * `extension`: 대상 파일 확장자 필터 조건 (`csv`, `xlsx`, `pkl` 등 또는 전체 대상의 경우 `all`)
+
+### 4.2 글로벌 하이퍼 파라미터 제어
+`main.py` 파일 내 엔진 및 리더 인스턴스 생성 시 시스템 성능과 자원 사용량을 튜닝할 수 있는 매개변수를 제공합니다.
+
+* `large_file_threshold_mb`: 대용량 파일로 판정할 메모리 기준점 (기본값: `1000` MB). 이 임계치보다 큰 파일은 메모리 적재 에러를 방지하기 위해 자동으로 청크 단위 스트리밍 샘플러로 전환됩니다.
+* `chunk_size`: 대용량 파일 스트리밍 시 한 번에 읽어 들일 레코드 행 수 (기본값: `100000` rows).
+* `sample_rows`: 프로파일링 정확도와 속도 간의 정합성을 유지하기 위해 수집할 정밀 분석 샘플 행의 크기 (기본값: `10000` rows).
+
+---
+
+## 5. 실행 및 가동 방법 (Operation)
+
+### 5.1 로컬 및 배포 환경 의존성 설치
+본 프로그램은 국내외 특수 데이터 규격(주민등록번호 체크섬, 전화번호 지역 코드 분기, 사업자등록번호 검증 등)을 처리하기 위해 외부 고성능 패키지 라이브러리를 참조합니다. 실행 전 반드시 패키지 설치가 필요합니다.
+
+```bash
+# 필수 의존성 패키지 일괄 설치
+pip install pandas numpy openpyxl pyyaml phonenumbers streamlit
+주의: Streamlit Cloud와 같은 클라우드 컨테이너 환경 배포 시, 루트 디렉토리에 requirements.txt 파일이 누락되면 ModuleNotFoundError (phonenumbers)가 발생하므로 배포 전 파일 포함 여부를 확인하십시오.
+
+5.2 프로그램 실행 방법
+디렉토리의 진입점 스크립트를 단독 혹은 배포 스케줄러를 통해 실행합니다.
+
+Bash
+python src/main.py
+5.3 실행 로그 출력 예시
+Plaintext
+============================================================
+DataSense Architecture 3.0 Pipeline Engine Core Start
+============================================================
+META_PATH: /mount/src/datasense/DS_Meta/CodeList_Meta.csv
+[Meta] 활성화된 작업 폴더/소스 수: 3 개
+[Reader] 대용량 파일 청크 샘플링 적용: TB_USER_LOG_2026.csv (1420.5MB)
+총 42개 컬럼 결과 수집 완료
+[Writer] 수행 상세 결과 파일 저장 완료: /mount/src/datasense/DS_Output/FileFormat.csv
+[Writer] 수행 마스터 통계 파일 저장 완료: /mount/src/datasense/DS_Output/FileStats.csv (3행)
+============================================================
+종료 상태: 성공 | 총 소요시간: 14.25초
+============================================================
+6. 데이터 산출물 레이아웃 명세 (Data Output Schema)
+최종 파일 시스템에 저장되는 FileFormat.csv 결과 파일은 데이터 거버넌스 및 데이터 사전 구축용 시스템과 즉시 인터페이스가 가능하도록 아래의 표준 레이아웃 순서 규격을 강제 적용하여 출력됩니다.
+
+컬럼 ID	물리 컬럼명	데이터 타입	설명
+1	FilePath	String	분석 대상 파일의 정규화된 전체 경로
+2	FileName	String	분석 대상 원본 물리 파일명
+3	ColumnName	String	파일 내 발견된 세부 필드/컬럼명
+4	MasterType	String	메타 파일에서 정의한 그룹 분류 타입 (Master 등)
+5	PK	String	기본키 식별자 여부 추정 데이터 값
+6	DataType	String	파이썬 판다스 베이스 물리 데이터 타입
+7	OracleType	String	Oracle SQL 스키마 마이그레이션 호환 매핑 타입
+8	DetailDataType	String	비즈니스 논리 상세 데이터 타입 (이메일, 전화번호 등)
+9	LenMin / LenMax	Integer	컬럼 내 데이터 문자열의 최소 및 최대 길이
+10	LenAvg / LenMode	Numeric	컬럼 내 데이터 문자열의 평균 및 최빈값 길이
+11	RecordCnt	Long Integer	원본 소스의 전체 물리 레코드 수 (청크 총합)
+12	SampleRows	Integer	실제 프로파일링 연산에 반영된 샘플링 레코드 수
+13	NullCnt / Null(%)	Num / Pct	결측치(빈값) 개수 및 전체 대비 결측 비율
+14	UniqueCnt / Unique(%)	Num / Pct	고유값 개수 및 데이터 중복 제거 후 카디널리티 비율
+15	Format / Format(%)	Str / Pct	최상위 제1순위 데이터 매칭 패턴 구조 및 매칭 비율
+7. 예외 처리 및 트러블슈팅 (Troubleshooting)
+ModuleNotFoundError: No module named 'phonenumbers'
+
+원인: 국내외 지역 번호 및 모바일 번호 유효성 진단용 외부 라이브러리가 유실되었습니다.
+
+해결: 콘솔 창에 pip install phonenumbers를 실행하거나, Streamlit Cloud 환경일 경우 최상위 루트 디렉토리에 phonenumbers가 명시된 requirements.txt가 포함되어 Git Push 되었는지 확인하고 'Reboot App'을 가동하십시오.
+
+FileNotFoundError (CodeList_Meta.csv 관련)
+
+원인: 프로그램 구동 위치에 따라 ROOT_PATH 계산의 상대적 위치가 어긋났거나 폴더가 누락된 경우입니다.
+
+해결: 프로그램 실행 파일 배포 방식에 따라 루트 추적 모듈이 빌트인 되어 있으므로, 파일 실행 위치를 최상위 루트 폴더로 고정한 후 구동하십시오.
+
+대용량 파일 분석 중 MemoryError 발생
+
+원인: 대형 데이터가 청크 처리를 거치지 않고 일시에 RAM 메모리에 로드되었습니다.
+
+해결: main.py 파일의 large_file_threshold_mb 설정값을 로컬 메모리 사양에 맞게 낮추어(예: 500 이하) 무조건 청크 샘플링 파이프라인을 타도록 강제하십시오.
+"""
+
+with open("DataSense_Program_Manual.md", "w", encoding="utf-8") as f:
+f.write(markdown_content)
+print("File generated successfully.")
+
+요청하신 데이터 품질 및 프로파일링 시스템(**DataSense**)의 아키텍처 구조와 명세를 담은 **사용자 및 개발자용 프로그램 설명서(README)**를 Markdown 파일로 작성하여 생성했습니다. 
+
+v3.0 모듈화 설계 원칙(I/O 계층과 Core 엔진의 분리), 대용량 데이터 파일 처리를 위한 청크 샘플링 파라미터 제어 가이드, 산출물 표준 레이아웃 매핑 구조, 그리고 배포 에러 대응을 위한 트러블슈팅 세션까지 정밀하게 구성하였습니다.
+
+### 📄 생성된 Markdown 파일 정보
+* **파일명**: `DataSense_Program_Manual.md`
+* **파일 태그**: [file-tag: code-generated-file-0-1780038560160307315]
+
+---
+
+### 💡 Markdown 주요 본문 미리보기 (Preview)
+
+```markdown
+# DataSense 데이터 품질 프로파일링 시스템 (DQ Profiling System)
+**사용자 및 개발자용 공식 프로그램 설명서**
+risk diagnosis system (지역 인구 기반 대학 입학수요위험도 진단 시스템)
+"입학수요위험도"는 학령인구 감소 직격탄을 맞고 있는 현재의 대학 IR(기관연구) 및 기획처에서 가장 핵심적으로 관리해야 하는 정량적 위기 지표입니다.
+
+정의해주신 4대 인자(지역 학령인구 감소, 대학 자체 경쟁력, 지역 내 경쟁 강도, 대학 규모 의존성)와 세부 필요 데이터(출생아, 고교 졸업자, 순이동 등)를 유기적으로 결합하여, 위험도를 점수화(0~100점)하고 이를 시각화하는 Python Streamlit 시각화 프로그램 아키텍처와 코드를 작성해 드립니다.
+
+1. 입학수요위험도 데이터 모델링 구조 (IR 설계 안)
+시스템의 정합성을 위해 입력 데이터를 다음과 같이 4대 지표로 표준화하여 연산합니다.
+
+지역 학령인구 감소 지표 (Demographic Weight): 출생아 수 변동률 + 고교 졸업자 수 추세 + 청년 유출률 반영
+
+대학 자체 경쟁력 지표 (Institutional Power): 최근 신입생 충원율 및 전년도 정시/수시 입시 경쟁률 역산
+
+지역 내 경쟁 강도 지표 (Regional Rivalry): 해당 권역 내 타 대학 수 및 정원 총합 대비 고교 졸업자 수 비율
+
+대학 규모 의존성 지표 (Scale Dependency): 대학 전체 재정 중 '등록금 수입 비중' 및 '전체 편제 정원 규모' (정원이 클수록 미충원 시 재정 타격이 기하급수적으로 증가)
+
+2. Streamlit 입학수요위험도 시각화 프로그램 코드
+이 코드는 가상의 공시 지표 데이터를 토대로 위험도 포트폴리오 매트릭스와 지역별 위험도 랭킹을 한눈에 보여주는 대시보드입니다.
+
+
+3. 프로그램 연산 및 화면 구성 가치
+4대 위험 인자의 수학적 정규화 및 가중치 결합
+
+출생아 수 감소, 청년 유출 등 단위와 규모가 다른 서로 다른 지표들을 최소-최대 정규화(Min-Max Scaling) 기법을 사용하여 각각 25점 만점의 점수로 환산합니다. 이를 합산하여 총 100점 만점 기준의 통합 입학수요위험도를 산출합니다.
+
+권역별 수평 비교 차트 (왼쪽)
+
+어떤 권역이 현재 인구 감소와 경쟁 구도 속에서 가장 먼저 위기를 맞이할지 직관적으로 리스트 업 해줍니다. (위험도가 높은 순으로 적색 그라데이션 시각화 반영)
+
+선택 권역 리스크 원인 진단 레이더 차트 (오른쪽)
+
+특정 권역을 선택하면 해당 지역 대학이 겪는 위기의 본질이 인구 감소 때문인지(학령인구감소), 과도한 대학 밀집 때문인지(지역경쟁강도), 아니면 해당 대학의 부실한 재정 자립도 때문인지(규모의존성) 구조적 원인을 명확하게 진단할 수 있도록 설계했습니다.
